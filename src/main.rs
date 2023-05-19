@@ -7,6 +7,8 @@ use hound::*;
 use rand::Rng;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
+// TODO remove seeding flag and just use thread rng - use a randomize alphanum for file name
+// use rand::rngs::ThreadRng;
 use rayon::prelude::*;
 use clap::Parser;
 use clap::{arg, command};
@@ -104,101 +106,88 @@ fn main() {
 
     let duration_samples = (duration * spec.sample_rate as f32) as u64;
 
-    let mut output: Vec<_> = (0..duration_samples).map(|_| 0i16).collect();
-
     let rng = Mutex::new(StdRng::seed_from_u64(seed));
 
-    let sample_range: Vec<_> = (0..duration_samples).collect();
     // TODO this has to vary with the number of grains added to the output in a given window
     let volume_reduction_factor = 0.01;
 
     // TODO: use - and compute/apply random pitch shift to each grain added to final output
     struct Grain {
         samples: Vec<i16>,
-        offset: u64,
     }
 
+    let grain_count = (duration_samples / grain_frequency as u64) as usize;
+    let grains_per_file = grain_count / wav_paths.len();
 
-    // TODO make this step by some overlapping window instead of by grain freq?
-    let grains: Vec<Grain> = sample_range.into_par_iter().step_by(grain_frequency as usize).map(|offset_in_output| {
-        // pick one random wav_path from from wav_paths
-        // TODO: should this pre-build the grains as a beginning step - maybe in a shared module that
-        // can be re-used for other commands doing different granular things?
-        let wav_paths = wav_paths.clone();
-        let wav_reader_index: usize;
-
-        {
-            wav_reader_index  = rng.lock().unwrap().gen_range(0..wav_paths.len());
-        }
-
-        let mut grain_samples: Vec<i16> = Vec::with_capacity(grain_size as usize);
-
-        match WavReader::open(wav_paths[wav_reader_index].clone()) {
+    let grains: Vec<Grain> = wav_paths.as_ref().into_par_iter().flat_map(|path| {
+        match WavReader::open(path) {
             Ok(mut wav_reader) => {
-                grain_samples.resize(grain_size as usize, 0);
+                let wav_size = wav_reader.len();
 
-                let offset: u32;
+                (0..grains_per_file).into_iter().map(|_| {
+                    let mut grain_samples: Vec<i16> = Vec::with_capacity(grain_size as usize);
+                    grain_samples.resize(grain_size as usize, 0);
 
-                {
-                    offset = rng.lock().unwrap().gen_range(0..(wav_reader.len() - grain_size).max(0) as u32);
-                }
+                    let offset: u32;
 
-                // TODO: implement pitch shifting
-                // let interval_index = rand_or_default(&rng, 0..intervals.len());
-
-                // let interval_range = intervals[interval_index].clone();
-                // let rand_interval_in_range: f32 = rand_or_default(&rng, interval_range);
-                // let pitch_shift = 2f32.powf(rand_interval_in_range / 12f32);
-
-                // let pan = rand_or_default(&rng, -panning..panning);
-                // let left_pan = 0.5 * (1f32 - pan);
-                // let right_pan = 0.5 * (1f32 + pan);
-
-                // TODO: working pitch shift
-                // let window_size = (grain_size as f32 * pitch_shift) as u32;
-
-                let fade_window_size = grain_size as u64 / 2;
-                wav_reader.seek(offset).unwrap();
-                // wav_reader.seek(offset + pos).unwrap();
-                let mut samples = wav_reader.samples::<i32>();
-
-                // TODO: make sure I understand exactly what this is doing
-                for j in 0..(grain_size as u64) {
-                    let fade = if j <= fade_window_size {
-                        j as f32 / fade_window_size as f32
-                    } else {
-                        1.0 - (j - fade_window_size) as f32 / fade_window_size as f32
-                    };
-
-                    let sample: i32;
-
-                    // let pos = (j as f32 * pitch_shift) as u32;
-                    // wav_reader.seek(offset + pos).unwrap();
-                    match samples.next() {
-                        Some(Ok(s)) => {
-                            sample = (s as f32 * fade) as i32;
-                        }
-                        _ => break,
+                    {
+                        offset = rng.lock().unwrap().gen_range(0..(wav_size - grain_size));
                     }
 
-                    let sample = (sample as f32 * volume_reduction_factor) as i64;
+                    let fade_window_size = grain_size as u64 / 2;
+                    wav_reader.seek(offset).unwrap();
+                    // wav_reader.seek(offset + pos).unwrap();
+                    let mut samples = wav_reader.samples::<i32>();
 
-                    // TODO: this seems wrong but maybe it's because the file is interleaved?
-                    grain_samples[j as usize] = sample as i16;
-                }
-            },
+                    for j in 0..(grain_size as u64) {
+                        let fade = if j <= fade_window_size {
+                            j as f32 / fade_window_size as f32
+                        } else {
+                            1.0 - (j - fade_window_size) as f32 / fade_window_size as f32
+                        };
+
+                        let sample: i32;
+
+                        // let pos = (j as f32 * pitch_shift) as u32;
+                        // wav_reader.seek(offset + pos).unwrap();
+                        match samples.next() {
+                            Some(Ok(s)) => {
+                                sample = (s as f32 * fade) as i32;
+                            }
+                            _ => break,
+                        }
+
+                        let sample = (sample as f32 * volume_reduction_factor) as i64;
+
+                        // TODO: this seems wrong but maybe it's because the file is interleaved?
+                        grain_samples[j as usize] = sample as i16;
+                    }
+
+                    Grain{ samples: grain_samples }
+                }).collect()
+            }
             Err(e) => {
-                println!("Error reading wav file: {}", e);
+                println!("Error opening wav file: {}", e);
+                Vec::new()
             }
         }
+    }).collect();
 
-        if let Ok(wav_reader) = &mut WavReader::open(wav_paths[wav_reader_index].clone()) {
-            grain_samples.resize(grain_size as usize, 0);
+    let mut output: Vec<_> = (0..duration_samples).map(|_| 0i16).collect();
 
-            let offset: u32;
+    let mut writer = WavWriter::create(format!("{}-{}.wav", output_base_name.to_str().unwrap(), seed), spec).unwrap();
 
-            {
-                offset = rng.lock().unwrap().gen_range(0..(wav_reader.len() - grain_size).max(0) as u32);
+    for grain in grains {
+        if !rng.lock().unwrap().gen_bool(grain_probability) {
+            continue;
+        }
+
+        let offset = rng.lock().unwrap().gen_range(0..(output.len() - grain.samples.len()));
+
+        for (i, sample) in grain.samples.iter().enumerate() {
+            let base_index = offset as usize + i;
+            if base_index + 1 >= output.len() {
+                break;
             }
 
             // TODO: implement pitch shifting
@@ -215,58 +204,12 @@ fn main() {
             // TODO: working pitch shift
             // let window_size = (grain_size as f32 * pitch_shift) as u32;
 
-            let fade_window_size = grain_size as u64 / 2;
-            wav_reader.seek(offset).unwrap();
-            // wav_reader.seek(offset + pos).unwrap();
-            let mut samples = wav_reader.samples::<i32>();
-
-            // TODO: make sure I understand exactly what this is doing
-            for j in 0..(grain_size as u64) {
-                let fade = if j <= fade_window_size {
-                    j as f32 / fade_window_size as f32
-                } else {
-                    1.0 - (j - fade_window_size) as f32 / fade_window_size as f32
-                };
-
-                let sample: i32;
-
-                // let pos = (j as f32 * pitch_shift) as u32;
-                // wav_reader.seek(offset + pos).unwrap();
-                match samples.next() {
-                    Some(Ok(s)) => {
-                        sample = (s as f32 * fade) as i32;
-                    }
-                    _ => break,
-                }
-
-                let sample = (sample as f32 * volume_reduction_factor) as i64;
-
-                // TODO: this seems wrong but maybe it's because the file is interleaved?
-                grain_samples[j as usize] = sample as i16;
-            }
-        }
-
-        Grain{ samples: grain_samples, offset: offset_in_output }
-    }).collect();
-
-    let mut writer = WavWriter::create(format!("{}-{}.wav", output_base_name.to_str().unwrap(), seed), spec).unwrap();
-
-    for grain in grains {
-        if !rng.lock().unwrap().gen_bool(grain_probability) {
-            continue;
-        }
-
-        for (i, sample) in grain.samples.iter().enumerate() {
-            let base_index = grain.offset as usize + i;
-            if base_index + 1 >= output.len() {
-                break;
-            }
-
             // TODO: figure out how to properly scale this value - maybe implement compansion -
             // spectral compander would be cool.
             if output[base_index] == 32767 || output[base_index] == -32768 {
                 break;
             } else {
+                // TODO: implement various mix modes
                 output[base_index] += *sample;
             }
         }
