@@ -105,7 +105,8 @@ fn main() {
     let rng = Mutex::new(StdRng::seed_from_u64(seed));
 
     let sample_range: Vec<_> = (0..duration_samples).collect();
-    let volume_reduction_factor = (1.0 / grain_size as f32 / grain_frequency as f32) * 4.0;
+    // TODO this has to vary with the number of grains added to the output in a given window
+    let volume_reduction_factor = 0.001;
 
     // TODO: use - and compute/apply random pitch shift to each grain added to final output
     struct Grain {
@@ -115,7 +116,7 @@ fn main() {
 
 
     // TODO make this step by some overlapping window instead of by grain freq?
-    let grains: Vec<Grain> = sample_range.into_par_iter().step_by(grain_frequency as usize).map(|i| {
+    let grains: Vec<Grain> = sample_range.into_par_iter().step_by(grain_frequency as usize).map(|offset_in_output| {
         // pick one random wav_path from from wav_paths
         // TODO: should this pre-build the grains as a beginning step - maybe in a shared module that
         // can be re-used for other commands doing different granular things?
@@ -156,7 +157,7 @@ fn main() {
             let mut samples = wav_reader.samples::<i32>();
 
             // TODO: make sure I understand exactly what this is doing
-            for j in 0..(grain_size as u64).min(duration_samples - i) {
+            for j in 0..(grain_size as u64) {
                 let fade = if j <= fade_window_size {
                     j as f32 / fade_window_size as f32
                 } else {
@@ -174,12 +175,6 @@ fn main() {
                     _ => break,
                 }
 
-                let base_index = if i + j == 0 { 0 } else { (i + j - 1) as usize };
-
-                if base_index + 1 >= output.len() {
-                    break;
-                }
-
                 let sample = (sample as f32 * volume_reduction_factor) as i64;
 
                 // TODO: this seems wrong but maybe it's because the file is interleaved?
@@ -187,7 +182,7 @@ fn main() {
             }
         }
 
-        Grain{ samples: grain_samples, offset: i }
+        Grain{ samples: grain_samples, offset: offset_in_output }
 
     }).collect();
 
