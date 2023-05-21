@@ -99,8 +99,10 @@ fn main() {
 
     let spec = WavSpec {
         channels: 2,
+        // TODO: make this configurable and properly interplate
+        // samples with different sample rates
         sample_rate: 44100,
-        bits_per_sample: 16,
+        bits_per_sample: 24,
         sample_format: SampleFormat::Int,
     };
 
@@ -114,6 +116,7 @@ fn main() {
     // TODO: use - and compute/apply random pitch shift to each grain added to final output
     struct Grain {
         samples: Vec<i16>,
+        channel_count: usize,
     }
 
     let grain_count = (duration_samples / grain_frequency as u64) as usize;
@@ -148,8 +151,6 @@ fn main() {
 
                         let sample: i32;
 
-                        // let pos = (j as f32 * pitch_shift) as u32;
-                        // wav_reader.seek(offset + pos).unwrap();
                         match samples.next() {
                             Some(Ok(s)) => {
                                 sample = (s as f32 * fade) as i32;
@@ -157,13 +158,14 @@ fn main() {
                             _ => break,
                         }
 
-                        let sample = (sample as f32 * volume_reduction_factor) as i64;
-
                         // TODO: this seems wrong but maybe it's because the file is interleaved?
                         grain_samples[j as usize] = sample as i16;
                     }
 
-                    Grain{ samples: grain_samples }
+                    Grain{
+                        samples: grain_samples,
+                        channel_count: wav_reader.spec().channels as usize
+                    }
                 }).collect()
             }
             Err(e) => {
@@ -185,6 +187,8 @@ fn main() {
         let offset = rng.lock().unwrap().gen_range(0..(output.len() - grain.samples.len()));
 
         for (i, sample) in grain.samples.iter().enumerate() {
+            let i = if grain.channel_count == 1 { i * 2 } else { i };
+
             let base_index = offset as usize + i;
             if base_index + 1 >= output.len() {
                 break;
@@ -210,7 +214,10 @@ fn main() {
                 break;
             } else {
                 // TODO: implement various mix modes
-                output[base_index] += *sample;
+                output[base_index] += (*sample as f32 * volume_reduction_factor) as i16;
+                if grain.channel_count == 1 {
+                    output[base_index + 1] += (*sample as f32 * volume_reduction_factor) as i16;
+                }
             }
         }
     }
