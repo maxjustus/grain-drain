@@ -5,17 +5,13 @@ extern crate clap;
 
 use hound::*;
 use rand::Rng;
-use rand::SeedableRng;
-use rand::rngs::StdRng;
-// TODO remove seeding flag and just use thread rng - use a randomize alphanum for file name
-// use rand::rngs::ThreadRng;
 use rayon::prelude::*;
 use clap::Parser;
 use clap::{arg, command};
 use std::fs;
-use std::sync::Mutex;
 use std::path::PathBuf;
 use rand::distributions::uniform::SampleUniform;
+use rand::thread_rng;
 
 #[derive(Parser)]
 #[command(name = "grain-drain", version = "0.1.0", about = "CLI for offline granular synthesis")]
@@ -48,11 +44,11 @@ struct Args {
     intervals: Option<String>,
 }
 
-fn rand_or_default<T: PartialOrd + SampleUniform>(rng: &Mutex<StdRng>, range: std::ops::Range<T>) -> T {
+fn rand_or_default<T: PartialOrd + SampleUniform>(range: std::ops::Range<T>) -> T {
     if range.start == range.end {
         range.start
     } else {
-        rng.lock().unwrap().gen_range(range)
+        thread_rng().gen_range(range)
     }
 }
 
@@ -67,7 +63,7 @@ fn compute_grain_size(wav_size: u32, channel_count: u16, grain_size: u32) -> u32
         grain_size
     };
 
-    rand::thread_rng().gen_range((max_grain_size / 4)..max_grain_size)
+    thread_rng().gen_range((max_grain_size / 4)..max_grain_size)
 }
 
 fn compute_volume_scale(wav_spec: hound::WavSpec) -> f32 {
@@ -84,7 +80,6 @@ fn parse_intervals(intervals: String) -> Vec<std::ops::Range<f32>> {
             let range: Vec<_> = s.split("..").collect();
             let start: f32 = range[0].parse().unwrap();
             let end: f32 = range[1].parse().unwrap();
-            // rand::thread_rng().gen_range(start..end)
             start..end
         } else {
             // parse string to float
@@ -92,6 +87,20 @@ fn parse_intervals(intervals: String) -> Vec<std::ops::Range<f32>> {
             s..s
         }
     }).collect()
+}
+
+fn generate_random_string(length: usize) -> String {
+    let mut rng = rand::thread_rng();
+
+    let chars: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    let random_string: String = (0..length)
+        .map(|_| {
+            let idx = rng.gen_range(0..chars.len());
+            chars[idx] as char
+        })
+        .collect();
+
+    random_string
 }
 
 fn main() {
@@ -103,8 +112,7 @@ fn main() {
     let grain_size: u32 = matches.grain_size_in_samples.unwrap_or(8000);
     let grain_frequency: usize = matches.grain_frequency.unwrap_or(1000);
     let grain_probability: f64 = matches.grain_probability.unwrap_or(1.0);
-    let seed: u64 = matches.seed.unwrap_or_else(|| rand::random::<u64>());
-    let panning: f32 = matches.panning.unwrap_or(1.0);
+    let panning: f32 = matches.panning.unwrap_or(1.0).clamp(-1.0, 1.0);
     let intervals = parse_intervals(matches.intervals.unwrap_or("0".to_owned()));
 
     let wav_paths : Vec<_> = fs::read_dir(input_dir.clone()).unwrap()
@@ -130,9 +138,7 @@ fn main() {
         sample_format: SampleFormat::Float,
     };
 
-    let duration_samples = (duration * spec.sample_rate as f32) as u64;
-
-    let rng = Mutex::new(StdRng::seed_from_u64(seed));
+    let duration_samples = (duration * spec.sample_rate as f32 * 2.0) as u64;
 
     // TODO this has to vary with the number of grains added to the output in a given window
     let volume_reduction_factor = 0.1;
@@ -155,30 +161,31 @@ fn main() {
                 let volume_scale = compute_volume_scale(wav_spec);
                 let grain_size = compute_grain_size(wav_size, channel_count, grain_size);
 
+                wav_reader.seek(0).unwrap();
+
+                let sample_reader: Box<dyn Iterator<Item = Result<f32>>> = if wav_spec.sample_format == hound::SampleFormat::Float {
+                     Box::new(wav_reader.samples::<f32>())
+                } else {
+                     Box::new(wav_reader.samples::<i32>().map(|res| res.map(|s| s as f32 / volume_scale)))
+                };
+
+                let samples: Vec<_> = sample_reader.collect();
+
                 (0..grains_per_file).into_iter().map(|_| {
+
+
                     let mut grain_samples: Vec<f32> = Vec::with_capacity(grain_size as usize);
                     grain_samples.resize(grain_size as usize, 0.0);
 
-                    let mut offset: u32;
-
-                    {
-                        offset = rng.lock().unwrap().gen_range(0..(wav_size - grain_size));
-                        if channel_count > 1 {
-                            // this code ensures that offset is always a multiple of channel count
-                            // to ensure that we're positioning the read head at the start of a sample
-                            // since multi-channel wavs are interleaved.
-                            offset = offset - (offset % channel_count as u32);
-                        }
+                    let mut offset = thread_rng().gen_range(0..(wav_size - grain_size)) as u64;
+                    if channel_count > 1 {
+                        // this code ensures that offset is always a multiple of channel count
+                        // to ensure that we're positioning the read head at the start of a sample
+                        // since multi-channel wavs are interleaved.
+                        offset = offset - (offset % channel_count as u64);
                     }
 
                     let fade_window_size = grain_size as u64 / 2;
-                    wav_reader.seek(offset).unwrap();
-
-                    let mut samples: Box<dyn Iterator<Item = Result<f32>>> = if wav_spec.sample_format == hound::SampleFormat::Float {
-                         Box::new(wav_reader.samples::<f32>())
-                    } else {
-                         Box::new(wav_reader.samples::<i32>().map(|res| res.map(|s| s as f32 / volume_scale)))
-                    };
 
                     for j in 0..(grain_size as u64) {
                         let j = if channel_count == 1 { j * 2 } else { j };
@@ -194,8 +201,8 @@ fn main() {
 
                         let sample: f32;
 
-                        match samples.next() {
-                            Some(Ok(s)) => {
+                        match samples[(offset as u64 + j).clamp(0 as u64, samples.len() as u64 - 1) as usize] {
+                            Ok(s) => {
                                 sample = s as f32 * fade;
                             }
                             _ => break,
@@ -225,14 +232,17 @@ fn main() {
     let mut output: Vec<f32> = Vec::with_capacity(duration_samples as usize);
     output.resize(duration_samples as usize, 0.0);
 
-    let mut writer = WavWriter::create(format!("{}-{}.wav", output_base_name.to_str().unwrap(), seed), spec).unwrap();
+    let output_name = format!("{}-{}.wav", output_base_name.to_str().unwrap(), generate_random_string(8));
+    let mut writer = WavWriter::create(output_name, spec).unwrap();
 
     for grain in grains {
-        if !rng.lock().unwrap().gen_bool(grain_probability) {
+        if !thread_rng().gen_bool(grain_probability) {
             continue;
         }
 
-        let offset = rng.lock().unwrap().gen_range(0..(output.len() - grain.samples.len()));
+        let offset = thread_rng().gen_range(0..(output.len() - grain.samples.len()));
+
+        let pan = rand_or_default(-panning..panning);
 
         for (i, sample) in grain.samples.iter().enumerate() {
             let output_index = offset as usize + i;
@@ -242,13 +252,22 @@ fn main() {
             // println!("{}, {}, {}", sample, output_index, output.len());
 
             // TODO: implement pitch shifting
-            // let interval_index = rand_or_default(&rng, 0..intervals.len());
+            // let interval_index = rand_or_default(0..intervals.len());
 
             // let interval_range = intervals[interval_index].clone();
-            // let rand_interval_in_range: f32 = rand_or_default(&rng, interval_range);
+            // let rand_interval_in_range: f32 = rand_or_default(interval_range);
             // let pitch_shift = 2f32.powf(rand_interval_in_range / 12f32);
 
-            // let pan = rand_or_default(&rng, -panning..panning);
+            let is_left = i % 2 == 0;
+            let sample = *sample * volume_reduction_factor;
+
+            let sample = if is_left {
+                sample * (1f32 - pan)
+            } else {
+                sample * (1f32 + pan)
+            };
+
+            // let pan = rand_or_default(-panning..panning);
             // let left_pan = 0.5 * (1f32 - pan);
             // let right_pan = 0.5 * (1f32 + pan);
 
@@ -258,10 +277,11 @@ fn main() {
             // TODO: figure out how to properly scale this value - maybe implement compansion -
             // spectral compander would be cool.
             if output[output_index] == f32::MAX || output[output_index] == f32::MIN {
+                // TODO what if it subtracted if it hits the threshold? might sound wacky/cool
                 break;
             } else {
                 // TODO: implement various mix modes
-                output[output_index] += *sample as f32 * volume_reduction_factor;
+                output[output_index] += sample;
                 // println!("{} {}", output[output_index], *sample);
             }
         }
