@@ -212,6 +212,7 @@ dependencies = [
  "crossbeam-channel",
  "hound",
  "rand",
+ "range-lock",
  "rayon",
 ]
 
@@ -355,6 +356,12 @@ checksum = "ec0be4795e2f6a28069bec0b5ff3e2ac9bafc99e6a9a7dc3547996c5c816922c"
 dependencies = [
  "getrandom",
 ]
+
+[[package]]
+name = "range-lock"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d345f823da1b6eb266f0297ed4c3b3bbf77da60dc667a130b27d08996c1934d6"
 
 [[package]]
 name = "rayon"

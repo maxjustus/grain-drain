@@ -10,9 +10,14 @@ use hound::*;
 use rand::distributions::uniform::SampleUniform;
 use rand::thread_rng;
 use rand::Rng;
-use rayon::prelude::*;
+use range_lock::VecRangeLock;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::sync::TryLockError;
+use std::thread;
+use std::time::Duration;
 
 #[derive(Parser)]
 #[command(
@@ -189,12 +194,6 @@ fn main() {
     // TODO this has to vary with the number of grains added to the output in a given window
     let volume_reduction_factor = 0.1;
 
-    // TODO: use - and compute/apply random pitch shift to each grain added to final output
-    struct Grain {
-        samples: Vec<f32>,
-        output_offset: usize,
-    }
-
     let grain_count = (duration_samples / grain_frequency as u64) as usize;
     let grains_per_file = grain_count / wav_paths.len();
     println!(
@@ -202,15 +201,21 @@ fn main() {
         grain_count, grains_per_file
     );
     let (path_sender, path_receiver) = bounded::<PathBuf>(1000);
-    let (grain_sender, grain_receiver) = bounded::<Grain>(10000);
 
     let num_cpus = std::thread::available_parallelism().unwrap().get();
+
+    let mut output: Vec<f32> = Vec::with_capacity(duration_samples as usize);
+    output.resize(duration_samples as usize, 0.0);
+    let output = std::sync::Arc::new(VecRangeLock::new(output));
+
+    let grains_processed = Arc::new(AtomicUsize::new(0));
 
     let grain_threads = (0..num_cpus)
         .into_iter()
         .map(|_| {
-            let grain_sender = grain_sender.clone();
             let path_receiver = path_receiver.clone();
+            let output = output.clone();
+            let grains_processed = grains_processed.clone();
 
             std::thread::spawn(move || {
                 for path in path_receiver.iter() {
@@ -253,6 +258,10 @@ fn main() {
                                 let mut read_offset =
                                     thread_rng().gen_range(0..(wav_size - grain_size)) as u64;
 
+                                let output_offset = thread_rng().gen_range(
+                                    0..(duration_samples as usize - grain_samples.len()),
+                                );
+
                                 if channel_count > 1 {
                                     // this code ensures that offset is always a multiple of channel count
                                     // to ensure that we're positioning the read head at the start of a sample
@@ -262,6 +271,26 @@ fn main() {
                                 }
 
                                 let fade_window_size = grain_size as u64 / 2;
+
+                                let mut output_range;
+
+                                loop {
+                                    match output.try_lock(
+                                        output_offset..(output_offset + grain_size as usize),
+                                    ) {
+                                        Ok(lock) => {
+                                            output_range = lock;
+                                            break;
+                                        }
+                                        Err(TryLockError::WouldBlock) => {
+                                            thread::sleep(Duration::from_millis(10));
+                                            continue;
+                                        }
+                                        Err(TryLockError::Poisoned(_)) => {
+                                            panic!("Lock was poisoned");
+                                        }
+                                    }
+                                }
 
                                 for j in 0..(grain_size as u64) {
                                     let j = if channel_count == 1 { j * 2 } else { j };
@@ -291,9 +320,25 @@ fn main() {
 
                                     let sample = sample * volume_reduction_factor;
 
+                                    let output_index = output_offset as u64 + j;
+                                    if output_index + 1 >= duration_samples {
+                                        break;
+                                    }
+
+                                    let j = j as usize;
+
+                                    if output_range[j] == f32::MAX
+                                        || output_range[j] == f32::MIN
+                                        || output_range[j + 1] == f32::MAX
+                                        || output_range[j + 1] == f32::MIN
+                                    {
+                                        // TODO what if it subtracted if it hits the threshold? might sound wacky/cool
+                                        break;
+                                    }
+
                                     if channel_count == 1 {
-                                        grain_samples[j as usize] = sample * 1f32 - pan;
-                                        grain_samples[j as usize + 1] = sample * 1f32 + pan;
+                                        output_range[j] += sample * 1f32 - pan;
+                                        output_range[j + 1] += sample * 1f32 + pan;
                                     } else {
                                         let is_left = j % 2 == 0;
                                         let sample = if is_left {
@@ -302,23 +347,18 @@ fn main() {
                                             sample * (1f32 + pan)
                                         };
 
-                                        grain_samples[j as usize] = sample;
+                                        output_range[j] += sample;
                                     }
                                 }
 
-                                let output_offset = thread_rng().gen_range(
-                                    0..(duration_samples as usize - grain_samples.len()),
-                                );
-
-                                // TODO: fix fade - it only fades in.
-                                // println!("grain samples: {:?}", grain_samples);
-
-                                grain_sender
-                                    .send(Grain {
-                                        samples: grain_samples,
-                                        output_offset,
-                                    })
-                                    .unwrap();
+                                let count_was = grains_processed.fetch_add(1, Ordering::SeqCst);
+                                if count_was % 1000 == 0 {
+                                    println!(
+                                        "total grains: {} grains processed: {}",
+                                        grain_count,
+                                        count_was + 1
+                                    );
+                                }
                             });
                         }
                         Err(e) => {
@@ -328,76 +368,9 @@ fn main() {
                 }
 
                 println!("grain thread exiting");
-                // closes the channel but any remaining messages can still be received
-                drop(grain_sender);
             })
         })
         .collect::<Vec<_>>();
-
-    let write_thread = std::thread::spawn(move || {
-        let mut output: Vec<f32> = Vec::with_capacity(duration_samples as usize);
-        output.resize(duration_samples as usize, 0.0);
-
-        let mut grains_processed = 0;
-
-        let output_name = format!(
-            "{}-{}.wav",
-            output_base_name.to_str().unwrap(),
-            generate_random_string(8)
-        );
-
-        for grain in grain_receiver.iter() {
-            let offset = grain.output_offset;
-
-            for (i, sample) in grain.samples.iter().enumerate() {
-                let output_index = offset as usize + i;
-                if output_index + 1 >= output.len() {
-                    break;
-                }
-                // println!("{}, {}, {}", sample, output_index, output.len());
-
-                // TODO: implement pitch shifting
-                // let interval_index = rand_or_default(0..intervals.len());
-
-                // let interval_range = intervals[interval_index].clone();
-                // let rand_interval_in_range: f32 = rand_or_default(interval_range);
-                // let pitch_shift = 2f32.powf(rand_interval_in_range / 12f32);
-
-                // let pan = rand_or_default(-panning..panning);
-                // let left_pan = 0.5 * (1f32 - pan);
-                // let right_pan = 0.5 * (1f32 + pan);
-
-                // TODO: working pitch shift
-                // let window_size = (grain_size as f32 * pitch_shift) as u32;
-
-                // TODO: figure out how to properly scale this value - maybe implement compansion -
-                // spectral compander would be cool.
-                if output[output_index] == f32::MAX || output[output_index] == f32::MIN {
-                    // TODO what if it subtracted if it hits the threshold? might sound wacky/cool
-                    break;
-                } else {
-                    // TODO: implement various mix modes
-                    output[output_index] += sample;
-                    // println!("{} {}", output[output_index], *sample);
-                }
-            }
-
-            grains_processed += 1;
-            println!(
-                "total grains: {} grains processed: {} enqueued grains to process {}",
-                grain_count,
-                grains_processed,
-                grain_receiver.len()
-            );
-        }
-
-        let mut writer = WavWriter::create(output_name, spec).unwrap();
-
-        // Writing output to file
-        for &sample in output.iter() {
-            writer.write_sample(sample).unwrap();
-        }
-    });
 
     wav_paths.iter().for_each(|path| {
         path_sender.send(path.clone()).unwrap();
@@ -409,8 +382,20 @@ fn main() {
         handle.join().unwrap();
     }
 
-    drop(grain_sender);
-    println!("Done!");
+    let output_name = format!(
+        "{}-{}.wav",
+        output_base_name.to_str().unwrap(),
+        generate_random_string(8)
+    );
 
-    write_thread.join().unwrap();
+    let mut writer = WavWriter::create(output_name, spec).unwrap();
+
+    let output = Arc::try_unwrap(output).unwrap().into_inner();
+
+    // Writing output to file
+    for &sample in output.iter() {
+        writer.write_sample(sample).unwrap();
+    }
+
+    println!("Done!");
 }
