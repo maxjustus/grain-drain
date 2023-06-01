@@ -294,6 +294,8 @@ fn main() {
 
                                 for j in 0..(grain_size as u64) {
                                     let j = if channel_count == 1 { j * 2 } else { j };
+                                    // TODO this seems suspect in conjunction with
+                                    // compute_grain_size behavior for mono samples. Investigate!
                                     if j + 1 >= grain_size as u64 {
                                         break;
                                     }
@@ -337,8 +339,8 @@ fn main() {
                                     }
 
                                     if channel_count == 1 {
-                                        output_range[j] += sample * 1f32 - pan;
-                                        output_range[j + 1] += sample * 1f32 + pan;
+                                        output_range[j] += sample * (1f32 - pan);
+                                        output_range[j + 1] += sample * (1f32 + pan);
                                     } else {
                                         let is_left = j % 2 == 0;
                                         let sample = if is_left {
