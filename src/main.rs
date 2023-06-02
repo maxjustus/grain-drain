@@ -194,7 +194,7 @@ fn main() {
     // TODO this has to vary with the number of grains added to the output in a given window
     let volume_reduction_factor = 0.1;
 
-    let grain_count = (duration_samples / grain_frequency as u64) as usize;
+    let grain_count = (duration_samples / grain_frequency as u64) as usize * 4;
     let grains_per_file = grain_count / wav_paths.len();
     println!(
         "grain_count: {}, grains_per_file: {}",
