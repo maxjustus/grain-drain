@@ -7,6 +7,7 @@ use clap::Parser;
 use clap::{arg, command};
 use crossbeam_channel::bounded;
 use hound::*;
+use noise::{NoiseFn, Perlin, RidgedMulti, Seedable};
 use rand::distributions::uniform::SampleUniform;
 use rand::thread_rng;
 use rand::Rng;
@@ -52,30 +53,19 @@ struct Args {
 
     #[arg(
         short = 'g',
-        long = "grain-size",
+        long = "max-grain-size",
         value_name = "SAMPLES",
-        help = "Grain size in samples"
+        help = "Max grain size in samples"
     )]
-    grain_size_in_samples: Option<u32>,
+    max_grain_size_in_samples: Option<u32>,
 
     #[arg(
-        short = 'f',
-        long = "grain-frequency",
-        value_name = "SAMPLES",
-        help = "Grain generation frequency"
+        short = 'c',
+        long = "grain-count",
+        value_name = "NUMBER",
+        help = "Number of grains to generate"
     )]
-    grain_frequency: Option<usize>,
-
-    #[arg(
-        short = 'r',
-        long = "grain-probability",
-        value_name = "0.0-1.0",
-        help = "Grain generation probability"
-    )]
-    grain_probability: Option<f64>,
-
-    #[arg(short = 's', long = "seed", value_name = "SEED", help = "Random seed")]
-    seed: Option<u64>,
+    grain_count: Option<usize>,
 
     #[arg(
         short = 'p',
@@ -94,16 +84,8 @@ struct Args {
     intervals: Option<String>,
 }
 
-fn rand_or_default<T: PartialOrd + SampleUniform>(range: std::ops::Range<T>) -> T {
-    if range.start == range.end {
-        range.start
-    } else {
-        thread_rng().gen_range(range)
-    }
-}
-
 fn compute_grain_size(wav_size: u32, channel_count: u16, grain_size: u32) -> u32 {
-    let max_grain_size = if wav_size < grain_size as u32 {
+    if wav_size < grain_size as u32 {
         if channel_count == 1 {
             wav_size as u32 * 2
         } else {
@@ -111,9 +93,7 @@ fn compute_grain_size(wav_size: u32, channel_count: u16, grain_size: u32) -> u32
         }
     } else {
         grain_size
-    };
-
-    thread_rng().gen_range((max_grain_size / 4)..max_grain_size)
+    }
 }
 
 fn compute_volume_scale(wav_spec: hound::WavSpec) -> f32 {
@@ -162,10 +142,9 @@ fn main() {
     let input_dir = matches.input_dir;
     let output_base_name = matches.output_base_name;
     let duration: f32 = matches.duration_in_sec.unwrap_or(100.0);
-    let grain_size: u32 = matches.grain_size_in_samples.unwrap_or(8000);
-    let grain_frequency: usize = matches.grain_frequency.unwrap_or(1000);
-    let grain_probability: f64 = matches.grain_probability.unwrap_or(1.0);
-    let panning: f32 = matches.panning.unwrap_or(1.0).clamp(-1.0, 1.0);
+    let grain_size: u32 = matches.max_grain_size_in_samples.unwrap_or(8000);
+    let grain_count: usize = matches.grain_count.unwrap_or(100000);
+    let panning: f32 = matches.panning.unwrap_or(1.0).clamp(0.0, 1.0);
     let intervals = parse_intervals(matches.intervals.unwrap_or("0".to_owned()));
 
     let wav_paths: Vec<_> = fs::read_dir(input_dir.clone())
@@ -192,9 +171,8 @@ fn main() {
     let duration_samples = (duration * spec.sample_rate as f32 * 2.0) as u64;
 
     // TODO this has to vary with the number of grains added to the output in a given window
-    let volume_reduction_factor = 0.1;
+    let volume_reduction_factor = 0.01;
 
-    let grain_count = (duration_samples / grain_frequency as u64) as usize * 4;
     let grains_per_file = grain_count / wav_paths.len();
     println!(
         "grain_count: {}, grains_per_file: {}",
@@ -202,7 +180,7 @@ fn main() {
     );
     let (path_sender, path_receiver) = bounded::<PathBuf>(1000);
 
-    let num_cpus = std::thread::available_parallelism().unwrap().get();
+    let num_cpus = std::thread::available_parallelism().unwrap().get() * 2;
 
     let mut output: Vec<f32> = Vec::with_capacity(duration_samples as usize);
     output.resize(duration_samples as usize, 0.0);
@@ -221,12 +199,14 @@ fn main() {
                 for path in path_receiver.iter() {
                     match WavReader::open(path) {
                         Ok(mut wav_reader) => {
+                            let seed = rand::random::<u32>();
+                            let noise_gen = Perlin::new(seed);
+
                             let wav_size = wav_reader.len();
                             let wav_spec = wav_reader.spec();
                             let channel_count = wav_spec.channels;
                             let volume_scale = compute_volume_scale(wav_spec);
-                            let grain_size =
-                                compute_grain_size(wav_size, channel_count, grain_size);
+                            let max_grain_size = compute_grain_size(wav_size, channel_count, grain_size) as f64;
 
                             wav_reader.seek(0).unwrap();
 
@@ -244,23 +224,33 @@ fn main() {
                             let samples: Vec<_> = sample_reader.collect();
                             // TODO: pre-allocate thread rng to avoid repeat invocations
 
-                            (0..grains_per_file).into_iter().for_each(|_| {
-                                if !thread_rng().gen_bool(grain_probability) {
-                                    return;
-                                }
-
+                            (0..grains_per_file).into_iter().for_each(|grain_number| {
+                                let grain_size_rand =
+                                    (noise_gen.get([0.1000, grain_number as f64 / 3000.0]) + 1.0) / 2.0;
+                                let grain_size = (grain_size_rand * max_grain_size) as u32;
                                 let mut grain_samples: Vec<f32> =
                                     Vec::with_capacity(grain_size as usize);
                                 grain_samples.resize(grain_size as usize, 0.0);
 
-                                let pan = rand_or_default(-panning..panning);
+                                // println!("{}", noise_gen.get([10.01, grain_number as f64 / 3000.0]) + 1.0);
+                                let output_rand =
+                                    (noise_gen.get([10.01, grain_number as f64 / 3000.0]) + 1.0) / 2.0;
+                                let output_offset = (output_rand
+                                    * (duration_samples as usize - grain_samples.len()) as f64)
+                                    as usize;
+                                // let output_offset = thread_rng().gen_range(
+                                //     0..(duration_samples as usize - grain_samples.len()),
+                                // );
+
+
+                                let pan = noise_gen.get([0.01, output_offset as f64 / 1000.0]) as f32
+                                    * panning;
+
+                                let read_rand =
+                                    (noise_gen.get([100.01, grain_number as f64 / 10.0]) + 1.0) / 2.0;
 
                                 let mut read_offset =
-                                    thread_rng().gen_range(0..(wav_size - grain_size)) as u64;
-
-                                let output_offset = thread_rng().gen_range(
-                                    0..(duration_samples as usize - grain_samples.len()),
-                                );
+                                    (read_rand * (wav_size - grain_size) as f64) as u64;
 
                                 if channel_count > 1 {
                                     // this code ensures that offset is always a multiple of channel count
@@ -320,12 +310,17 @@ fn main() {
                                         _ => break,
                                     }
 
-                                    let sample = sample * volume_reduction_factor;
-
                                     let output_index = output_offset as u64 + j;
                                     if output_index + 1 >= duration_samples {
                                         break;
                                     }
+
+                                    // TODO: extract scaling noise_gen noise to 0.0-1.0 range to a function
+                                    let volume_rand =
+                                        (noise_gen.get([200.01, output_index as f64 / 200000.0]) + 1.0)
+                                            / 2.0;
+                                    let sample =
+                                        sample * volume_reduction_factor * volume_rand as f32;
 
                                     let j = j as usize;
 
@@ -356,9 +351,8 @@ fn main() {
                                 let count_was = grains_processed.fetch_add(1, Ordering::SeqCst);
                                 if count_was % 1000 == 0 {
                                     println!(
-                                        "total grains: {} grains processed: {}",
-                                        grain_count,
-                                        count_was + 1
+                                        "percent complete: {}%",
+                                        (count_was as f32 / grain_count as f32) * 100.0,
                                     );
                                 }
                             });
