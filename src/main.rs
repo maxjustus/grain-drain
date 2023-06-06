@@ -11,7 +11,6 @@ use noise::{NoiseFn, Perlin, RidgedMulti, Seedable};
 use rand::distributions::uniform::SampleUniform;
 use rand::thread_rng;
 use rand::Rng;
-use range_lock::VecRangeLock;
 use std::fs;
 use std::path::PathBuf;
 use std::collections::HashMap;
@@ -219,16 +218,19 @@ fn main() {
                             let max_grain_duration = compute_grain_duration(wav_size, channel_count, grain_size) as f64;
 
                             let seed = rand::random::<u32>();
+                            // offset the lookup index because otherwise the random values
+                            // are too similar between files even with different random seeds
+                            let noise_offset = rand::random::<f64>();
                             let noise_gen = Perlin::new(seed);
 
                             let rand_val = |offset: f64, index: f64, scale: f64| {
-                                // noise_gen.get([offset, index as f64 / scale]);
-                                thread_rng().gen_range(-1.0..1.0)
+                                // thread_rng().gen_range(-1.0..1.0)
+                                noise_gen.get([offset + noise_offset, index as f64 / scale])
                             };
 
                             let positive_rand_val = |offset: f64, index: f64, scale: f64| {
-                                // rand_val(offset, index, scale).abs();
-                                thread_rng().gen_range(0.0..1.0)
+                                // thread_rng().gen_range(0.0..1.0)
+                                rand_val(offset, index, scale).abs()
                             };
 
                             let mut grains_to_process = HashMap::<u32, Vec<Grain>>::new();
@@ -328,8 +330,12 @@ fn main() {
                                                 continue;
                                             }
 
-                                            let current_grain_write_offset = (grain.output_start + current_sample_index) as usize;
+                                            let mut current_grain_write_offset = (grain.output_start + current_sample_index) as usize;
                                             let current_grain_read_offset = current_sample_index - grain.read_start;
+                                            if channel_count == 1 {
+                                                current_grain_write_offset *= 2;
+                                            }
+
                                             if current_grain_write_offset >= output.len() - 1 {
                                                 continue;
                                             };
