@@ -236,6 +236,8 @@ fn main() {
                             let mut grains_to_process = HashMap::<u32, Vec<Grain>>::new();
                             let mut processing_grains = HashMap::<u32, Grain>::new();
                             let mut processed_grains = Vec::<u32>::new();
+                            let mut min_read_start = 0;
+                            let mut max_read_end = 0;
 
                             // Generate metadata for grains to process - TODO: could this be extracted?
                             (0..grains_per_file).into_iter().for_each(|grain_number| {
@@ -256,7 +258,11 @@ fn main() {
                                         read_start - (read_start % channel_count as u32);
                                 }
 
+                                min_read_start = cmp::min(min_read_start, read_start);
+
                                 let read_end = cmp::min(read_start + grain_duration, wav_size);
+                                max_read_end = cmp::max(max_read_end, read_end);
+
                                 let output_rand = positive_rand_val(10.01, grain_number as f64, 3000.0);
                                 let output_start = (output_rand * (output_duration_samples - grain_duration as u64) as f64) as u32;
                                 let pan = rand_val(0.01, output_start as f64, 1000.0) as f32 * panning;
@@ -277,7 +283,7 @@ fn main() {
                                     .or_insert_with(Vec::new).push(grain);
                             });
 
-                            wav_reader.seek(0).unwrap();
+                            wav_reader.seek(min_read_start).unwrap();
 
                             let sample_reader: Box<dyn Iterator<Item = Result<f32>>> =
                                 if wav_spec.sample_format == hound::SampleFormat::Float {
@@ -290,12 +296,13 @@ fn main() {
                                     )
                                 };
 
-                            let samples: Vec<_> = sample_reader.collect();
+                            let sample_range_count = max_read_end - min_read_start;
+                            let samples: Vec<_> = sample_reader.take(sample_range_count as usize).collect();
 
                             for (current_sample_index, sample) in (&samples).iter().enumerate() {
                                 match sample {
                                     Ok(sample) => {
-                                        let current_sample_index = current_sample_index as u32;
+                                        let current_sample_index = current_sample_index as u32 + min_read_start;
                                         let is_left = current_sample_index % 2 == 0;
 
                                         if grains_to_process.get(&current_sample_index).is_some() {
