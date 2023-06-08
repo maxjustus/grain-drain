@@ -7,7 +7,7 @@ use clap::Parser;
 use clap::{arg, command};
 use crossbeam_channel::bounded;
 use hound::*;
-use noise::{NoiseFn, Perlin, RidgedMulti, Seedable};
+use noise::{NoiseFn, Perlin, RidgedMulti, PerlinSurflet, Seedable, Fbm, Blend};
 use rand::distributions::uniform::SampleUniform;
 use rand::thread_rng;
 use rand::Rng;
@@ -20,6 +20,58 @@ use std::sync::TryLockError;
 use std::thread;
 use std::time::Duration;
 use std::cmp;
+
+// straight from chatGPT - TODO: analyze and extract into separate file
+use std::collections::VecDeque;
+
+pub struct LookaheadCompander {
+    lookahead: usize,
+    threshold: f64,
+    attack_rate: f64,
+    release_rate: f64,
+    buffer: VecDeque<f64>,
+    env: f64,
+}
+
+impl LookaheadCompander {
+    pub fn new(lookahead: usize, threshold: f64, attack: f64, release: f64) -> Self {
+        Self {
+            lookahead,
+            threshold,
+            attack_rate: attack.recip(),
+            release_rate: release.recip(),
+            buffer: VecDeque::with_capacity(lookahead),
+            env: 0.0,
+        }
+    }
+
+    pub fn process(&mut self, input: &mut [f64]) {
+        for sample in input.iter_mut() {
+            self.buffer.push_back(*sample);
+
+            let level = sample.abs();
+            let rate = if level > self.env {
+                self.attack_rate
+            } else {
+                self.release_rate
+            };
+            self.env += rate * (level - self.env);
+
+            if self.buffer.len() >= self.lookahead {
+                let delayed = self.buffer.pop_front().unwrap();
+
+                let gain = if self.env > self.threshold {
+                    self.threshold / self.env
+                } else {
+                    1.0
+                };
+
+                *sample = delayed * gain;
+            }
+        }
+    }
+}
+
 
 #[derive(Parser)]
 #[command(
@@ -77,12 +129,34 @@ struct Args {
     panning: Option<f32>,
 
     #[arg(
+        short = 's',
+        long = "rand-scan-speed",
+        value_name = "FACTOR",
+        help = "Factor to divide random value scanning rate by. Smaller numbers mean slower changes in random values. Higher numbers means faster changes, approaching noise. Positive numbers only. Does not apply when diffused-random is true. DEFAULT: 0.0001"
+    )]
+    rand_speed: Option<f64>,
+
+    #[arg(
         short = 'n',
         long = "intervals",
         value_name = "INTERVALS",
         help = "Comma seperated list of pitch shifting semitone intervals to choose from - (e.g. 0.0..0.1,-12,12)"
     )]
     intervals: Option<String>,
+
+    #[arg(
+        short = 'r',
+        long = "diffused-random",
+        help = "Use diffused random values for grain parameters. Will create a uniform distribution of random values rather than using Perlin noise"
+    )]
+    diffused_random: Option<bool>,
+
+    #[arg(
+        short = 'f',
+        long = "file-percentage",
+        help = "Percentage of files in input directory to use. (0.0..1.0)"
+    )]
+    file_percentage: Option<f32>,
 }
 
 fn compute_grain_duration(wav_size: u32, channel_count: u16, grain_duration: u32) -> u32 {
@@ -124,12 +198,10 @@ fn parse_intervals(intervals: String) -> Vec<std::ops::Range<f32>> {
 }
 
 fn generate_random_string(length: usize) -> String {
-    let mut rng = rand::thread_rng();
-
     let chars: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
     let random_string: String = (0..length)
         .map(|_| {
-            let idx = rng.gen_range(0..chars.len());
+            let idx = thread_rng().gen_range(0..chars.len());
             chars[idx] as char
         })
         .collect();
@@ -145,7 +217,54 @@ struct Grain {
     output_start: u32,
     fade_window_size: u32,
     pan: f32,
+    volume: f32,
     pitch: f32,
+}
+
+fn mix(outputs: &Vec<Vec<f64>>) -> Vec<f64> {
+    let output_duration_samples = outputs[0].len();
+    let mut mixed_output: Vec<f64> = Vec::with_capacity(output_duration_samples as usize);
+
+    // Writing output to file
+    let mut max_sample = 0.0;
+    for i in 0..output_duration_samples {
+        let mut sample: f64 = 0.0;
+
+        for output in outputs {
+            sample += output[i as usize] as f64;
+        }
+
+        if sample > max_sample {
+            max_sample = sample;
+        }
+
+        mixed_output.push(sample);
+    };
+
+    let normalized_factor = 1.0 / max_sample;
+
+    for i in 0..mixed_output.len() {
+        mixed_output[i] = mixed_output[i] * normalized_factor;
+    }
+
+    // This doesn't care about stereo - so it just compands each sample but that's kinda ok
+    let mut compander = LookaheadCompander::new(500, 0.03, 5000.0, 5000.0);
+    compander.process(&mut mixed_output);
+
+    normalize(&mut mixed_output);
+    // let max_sample = mixed_output.iter().max_by(|a, b| a.total_cmp(b)).unwrap();
+    // let normalized_factor = 1.0 / max_sample;
+
+    // mixed_output.iter_mut().for_each(|s| *s = *s / normalized_factor);
+
+    mixed_output
+}
+
+fn normalize(buff: &mut Vec<f64>) {
+    let max_sample = buff.iter().max_by(|a, b| a.total_cmp(b)).unwrap();
+    let normalized_factor = 1.0 / max_sample;
+
+    buff.iter_mut().for_each(|s| *s = *s / normalized_factor);
 }
 
 fn main() {
@@ -158,16 +277,21 @@ fn main() {
     let grain_count: usize = matches.grain_count.unwrap_or(100000);
     let report_interval: usize = grain_count / 1000;
     let panning: f32 = matches.panning.unwrap_or(1.0).clamp(0.0, 1.0);
+    let file_percentage: f32 = matches.file_percentage.unwrap_or(1.0).clamp(0.0, 1.0);
     let intervals = parse_intervals(matches.intervals.unwrap_or("0".to_owned()));
     // TODO: make this a command line arg - this is a multiplier for the rate at which perlin noise
     // is scanned through
-    let rand_speed = 0.1;
+    let rand_speed: f64 = matches.rand_speed.unwrap_or(0.0001).abs();
+    let use_diffused_random = matches.diffused_random.unwrap_or(false);
 
     let wav_paths: Vec<_> = fs::read_dir(input_dir.clone())
         .unwrap()
         .into_iter()
         .filter_map(|f| f.map(|e| e.path()).ok())
         .filter(|p| p.extension().map(|e| e == "wav").unwrap_or(false))
+        .filter(|_| {
+            file_percentage == 1.0 || thread_rng().gen_range(0.0..1.0) <= file_percentage
+        })
         .collect();
 
     if wav_paths.len() == 0 {
@@ -179,7 +303,7 @@ fn main() {
         channels: 2,
         // TODO: make this configurable and properly interplate
         // samples with different sample rates
-        sample_rate: 44100,
+        sample_rate: 48000,
         bits_per_sample: 32,
         sample_format: SampleFormat::Float,
     };
@@ -193,9 +317,12 @@ fn main() {
     );
     let (path_sender, path_receiver) = bounded::<PathBuf>(1000);
 
-    let num_cpus = std::thread::available_parallelism().unwrap().get() * 2;
+    let num_cpus = std::thread::available_parallelism().unwrap().get();
 
     let grains_processed = Arc::new(AtomicUsize::new(0));
+
+    let seed = rand::random::<u32>();
+    // let noise_gen = PerlinSurflet::new(seed);
 
     let grain_threads = (0..num_cpus)
         .into_iter()
@@ -208,6 +335,11 @@ fn main() {
                 let mut output: Vec<f64> = Vec::with_capacity(output_duration_samples as usize);
                 output.resize(output_duration_samples as usize, 0.0);
 
+                let perlin = Perlin::new(seed);
+                let ridged = RidgedMulti::<Perlin>::new(seed);
+                let fbm = Fbm::<Perlin>::new(seed);
+                let noise_gen = Blend::new(perlin, ridged, fbm);
+
                 for path in path_receiver.iter() {
                     match WavReader::open(path) {
                         Ok(mut wav_reader) => {
@@ -217,20 +349,27 @@ fn main() {
                             let volume_scale = compute_volume_scale(wav_spec);
                             let max_grain_duration = compute_grain_duration(wav_size, channel_count, grain_size) as f64;
 
-                            let seed = rand::random::<u32>();
                             // offset the lookup index because otherwise the random values
                             // are too similar between files even with different random seeds
-                            let noise_offset = rand::random::<f64>();
-                            let noise_gen = Perlin::new(seed);
+                            // let noise_offset = rand::random::<f64>();
+                            let noise_offset = thread_rng().gen_range(0.0..1000.0);
+                            // actually now it sounds cool? lol
+                            // let noise_offset = 0.0;
 
                             let rand_val = |offset: f64, index: f64, scale: f64| {
-                                // thread_rng().gen_range(-1.0..1.0)
-                                noise_gen.get([offset + noise_offset, index as f64 / (scale / rand_speed)])
+                                if use_diffused_random {
+                                    thread_rng().gen_range(-1.0..1.0)
+                                } else {
+                                    noise_gen.get([offset + noise_offset, index as f64 / (scale / rand_speed)])
+                                }
                             };
 
                             let positive_rand_val = |offset: f64, index: f64, scale: f64| {
-                                // thread_rng().gen_range(0.0..1.0)
-                                rand_val(offset, index, scale).abs()
+                                if use_diffused_random {
+                                    thread_rng().gen_range(0.0..1.0)
+                                } else {
+                                    rand_val(offset, index, scale).abs()
+                                }
                             };
 
                             let mut grains_to_process = HashMap::<u32, Vec<Grain>>::new();
@@ -240,12 +379,13 @@ fn main() {
                             let mut max_read_end = 0;
 
                             // Generate metadata for grains to process - TODO: could this be extracted?
-                            (0..grains_per_file).into_iter().for_each(|grain_number| {
+                            for grain_number in 0..grains_per_file {
                                 let grain_duration_rand = positive_rand_val(0.1, grain_number as f64, 3000.0);
-                                // minimum is 100 to avoid clicks
+                                // // minimum is 100 to avoid clicks
                                 let grain_duration = cmp::max(100, (grain_duration_rand * max_grain_duration) as u32);
+                                // let grain_duration = max_grain_duration;
 
-                                let read_rand = positive_rand_val(100.01, grain_number as f64, 10.0);
+                                let read_rand = positive_rand_val(100.01, grain_number as f64, 1.0);
 
                                 let mut read_start =
                                     (read_rand * (wav_size - grain_duration) as f64) as u32;
@@ -263,9 +403,10 @@ fn main() {
                                 let read_end = cmp::min(read_start + grain_duration, wav_size);
                                 max_read_end = cmp::max(max_read_end, read_end);
 
-                                let output_rand = positive_rand_val(10.01, grain_number as f64, 3000.0);
+                                let output_rand = positive_rand_val(10.01, grain_number as f64, 1.0);
                                 let output_start = (output_rand * (output_duration_samples - grain_duration as u64) as f64) as u32;
-                                let pan = rand_val(0.01, output_start as f64, 1000.0) as f32 * panning;
+                                let volume = positive_rand_val(200.01, output_start as f64, 200000.0) as f32;
+                                let pan = rand_val(0.01, output_start as f64, 10.0) as f32 * panning;
 
                                 let fade_window_size = grain_duration / 2;
 
@@ -276,12 +417,13 @@ fn main() {
                                     output_start,
                                     fade_window_size,
                                     pan,
+                                    volume,
                                     pitch: 0.0,
                                 };
 
                                 grains_to_process.entry(read_start)
                                     .or_insert_with(Vec::new).push(grain);
-                            });
+                            };
 
                             wav_reader.seek(min_read_start).unwrap();
 
@@ -356,8 +498,7 @@ fn main() {
                                                     / fade_window_size as f32
                                             };
 
-                                            let volume_rand =
-                                                positive_rand_val(200.01, current_grain_write_offset as f64, 200000.0);
+                                            let volume_rand = grain.volume;
 
                                             let sample =
                                                 sample * volume_rand as f32 * fade;
@@ -404,9 +545,9 @@ fn main() {
         })
         .collect::<Vec<_>>();
 
-    wav_paths.iter().for_each(|path| {
+    for path in wav_paths {
         path_sender.send(path.clone()).unwrap();
-    });
+    };
 
     drop(path_sender);
 
@@ -422,30 +563,10 @@ fn main() {
 
     let mut writer = WavWriter::create(output_name, spec).unwrap();
 
-    let mut mixed_output: Vec<f64> = Vec::with_capacity(output_duration_samples as usize);
-
-
-
-    // Writing output to file
-    let mut max_sample = 0.0;
-    for i in 0..output_duration_samples {
-        let mut sample: f64 = 0.0;
-
-        for output in &outputs {
-            sample += output[i as usize] as f64;
-        }
-
-        if sample > max_sample {
-            max_sample = sample;
-        }
-
-        mixed_output.push(sample);
-    }
-
-    let normalized_factor = 1.0 / max_sample;
+    let mixed_output = mix(&outputs);
 
     for sample in mixed_output {
-        writer.write_sample((sample * normalized_factor) as f32).unwrap();
+        writer.write_sample(sample as f32).unwrap();
     }
 
     println!("Done!");
