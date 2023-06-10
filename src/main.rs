@@ -7,19 +7,21 @@ use clap::Parser;
 use clap::{arg, command};
 use crossbeam_channel::bounded;
 use hound::*;
-use noise::{NoiseFn, Perlin, RidgedMulti, PerlinSurflet, Seedable, Fbm, Blend};
+use noise::{Blend, Fbm, NoiseFn, Perlin, PerlinSurflet, RidgedMulti, Seedable};
 use rand::distributions::uniform::SampleUniform;
 use rand::thread_rng;
 use rand::Rng;
-use std::fs;
-use std::path::PathBuf;
+use std::cmp;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::TryLockError;
 use std::thread;
 use std::time::Duration;
-use std::cmp;
+use walkdir::DirEntry;
+use walkdir::WalkDir;
+use std::f32::consts::FRAC_PI_2;
 
 // straight from chatGPT - TODO: analyze and extract into separate file
 use std::collections::VecDeque;
@@ -71,7 +73,6 @@ impl LookaheadCompander {
         }
     }
 }
-
 
 #[derive(Parser)]
 #[command(
@@ -157,6 +158,12 @@ struct Args {
         help = "Percentage of files in input directory to use. (0.0..1.0)"
     )]
     file_percentage: Option<f32>,
+
+    #[arg(
+        long = "filter",
+        help = "Filter files in input directory by file name. (e.g. *.wav)"
+    )]
+    filter: Option<String>,
 }
 
 fn compute_grain_duration(wav_size: u32, channel_count: u16, grain_duration: u32) -> u32 {
@@ -216,7 +223,8 @@ struct Grain {
     read_end: u32,
     output_start: u32,
     fade_window_size: u32,
-    pan: f32,
+    pan_left_multiplier: f32,
+    pan_right_multiplier: f32,
     volume: f32,
     pitch: f32,
 }
@@ -234,12 +242,12 @@ fn mix(outputs: &Vec<Vec<f64>>) -> Vec<f64> {
             sample += output[i as usize] as f64;
         }
 
-        if sample > max_sample {
-            max_sample = sample;
+        if sample.abs() > max_sample {
+            max_sample = sample.abs();
         }
 
         mixed_output.push(sample);
-    };
+    }
 
     let normalized_factor = 1.0 / max_sample;
 
@@ -251,7 +259,7 @@ fn mix(outputs: &Vec<Vec<f64>>) -> Vec<f64> {
     let mut compander = LookaheadCompander::new(500, 0.03, 5000.0, 5000.0);
     compander.process(&mut mixed_output);
 
-    normalize(&mut mixed_output);
+    // normalize(&mut mixed_output);
     // let max_sample = mixed_output.iter().max_by(|a, b| a.total_cmp(b)).unwrap();
     // let normalized_factor = 1.0 / max_sample;
 
@@ -261,8 +269,12 @@ fn mix(outputs: &Vec<Vec<f64>>) -> Vec<f64> {
 }
 
 fn normalize(buff: &mut Vec<f64>) {
-    let max_sample = buff.iter().max_by(|a, b| a.total_cmp(b)).unwrap();
+    let max_sample = buff
+        .iter()
+        .max_by(|a, b| a.abs().total_cmp(&b.abs()))
+        .unwrap();
     let normalized_factor = 1.0 / max_sample;
+    println!("normalized factor: {}", normalized_factor);
 
     buff.iter_mut().for_each(|s| *s = *s / normalized_factor);
 }
@@ -283,14 +295,21 @@ fn main() {
     // is scanned through
     let rand_speed: f64 = matches.rand_speed.unwrap_or(0.0001).abs();
     let use_diffused_random = matches.diffused_random.unwrap_or(false);
+    let file_filter = matches.filter.unwrap_or("".to_owned());
 
-    let wav_paths: Vec<_> = fs::read_dir(input_dir.clone())
-        .unwrap()
+    let wav_paths: Vec<_> = WalkDir::new(input_dir.clone())
         .into_iter()
-        .filter_map(|f| f.map(|e| e.path()).ok())
-        .filter(|p| p.extension().map(|e| e == "wav").unwrap_or(false))
-        .filter(|_| {
-            file_percentage == 1.0 || thread_rng().gen_range(0.0..1.0) <= file_percentage
+        .filter_entry(|p| {
+            let file_name = p.file_name().to_str().unwrap();
+            p.file_type().is_dir() || (
+                file_name.ends_with(".wav") &&
+                file_filter.is_empty() || file_name.contains(&file_filter)
+            )
+        })
+        .filter_map(|f| f.ok())
+        .filter(|f| {
+            (file_percentage == 1.0 || thread_rng().gen_range(0.0..1.0) <= file_percentage)
+                && WavReader::open(f.path()).is_ok()
         })
         .collect();
 
@@ -315,7 +334,7 @@ fn main() {
         "grain_count: {}, grains_per_file: {}",
         grain_count, grains_per_file
     );
-    let (path_sender, path_receiver) = bounded::<PathBuf>(1000);
+    let (path_sender, path_receiver) = bounded::<DirEntry>(1000);
 
     let num_cpus = std::thread::available_parallelism().unwrap().get();
 
@@ -341,200 +360,220 @@ fn main() {
                 let noise_gen = Blend::new(perlin, ridged, fbm);
 
                 for path in path_receiver.iter() {
-                    match WavReader::open(path) {
-                        Ok(mut wav_reader) => {
-                            let wav_size = wav_reader.len();
-                            let wav_spec = wav_reader.spec();
-                            let channel_count = wav_spec.channels;
-                            let volume_scale = compute_volume_scale(wav_spec);
-                            let max_grain_duration = compute_grain_duration(wav_size, channel_count, grain_size) as f64;
+                    // already verified that files can be read as a part of initial scan so we just
+                    // unwrap
+                    let mut wav_reader = WavReader::open(path.path()).unwrap();
 
-                            // offset the lookup index because otherwise the random values
-                            // are too similar between files even with different random seeds
-                            // let noise_offset = rand::random::<f64>();
-                            let noise_offset = thread_rng().gen_range(0.0..1000.0);
-                            // actually now it sounds cool? lol
-                            // let noise_offset = 0.0;
+                    let wav_size = wav_reader.len();
+                    let wav_spec = wav_reader.spec();
+                    let channel_count = wav_spec.channels;
+                    let volume_scale = compute_volume_scale(wav_spec);
+                    let max_grain_duration =
+                        compute_grain_duration(wav_size, channel_count, grain_size) as f64;
 
-                            let rand_val = |offset: f64, index: f64, scale: f64| {
-                                if use_diffused_random {
-                                    thread_rng().gen_range(-1.0..1.0)
-                                } else {
-                                    noise_gen.get([offset + noise_offset, index as f64 / (scale / rand_speed)])
-                                }
-                            };
+                    // offset the lookup index because otherwise the random values
+                    // are too similar between files even with different random seeds
+                    // let noise_offset = rand::random::<f64>();
+                    let noise_offset = thread_rng().gen_range(0.0..1.0);
+                    // actually now it sounds cool? lol
+                    // let noise_offset = 0.0;
 
-                            let positive_rand_val = |offset: f64, index: f64, scale: f64| {
-                                if use_diffused_random {
-                                    thread_rng().gen_range(0.0..1.0)
-                                } else {
-                                    rand_val(offset, index, scale).abs()
-                                }
-                            };
+                    let rand_val = |offset: f64, index: f64, scale: f64| {
+                        if use_diffused_random {
+                            thread_rng().gen_range(-1.0..1.0)
+                        } else {
+                            noise_gen
+                                .get([offset + noise_offset, index as f64 / (scale / rand_speed)])
+                        }
+                    };
 
-                            let mut grains_to_process = HashMap::<u32, Vec<Grain>>::new();
-                            let mut processing_grains = HashMap::<u32, Grain>::new();
-                            let mut processed_grains = Vec::<u32>::new();
-                            let mut min_read_start = 0;
-                            let mut max_read_end = 0;
+                    let positive_rand_val = |offset: f64, index: f64, scale: f64| {
+                        if use_diffused_random {
+                            thread_rng().gen_range(0.0..1.0)
+                        } else {
+                            rand_val(offset, index, scale).abs()
+                        }
+                    };
 
-                            // Generate metadata for grains to process - TODO: could this be extracted?
-                            for grain_number in 0..grains_per_file {
-                                let grain_duration_rand = positive_rand_val(0.1, grain_number as f64, 3000.0);
-                                // // minimum is 100 to avoid clicks
-                                let grain_duration = cmp::max(100, (grain_duration_rand * max_grain_duration) as u32);
-                                // let grain_duration = max_grain_duration;
+                    let mut grains_to_process = HashMap::<u32, Vec<Grain>>::new();
+                    let mut processing_grains = HashMap::<u32, Grain>::new();
+                    let mut processed_grains = Vec::<u32>::new();
+                    let mut min_read_start = 0;
+                    let mut max_read_end = 0;
 
-                                let read_rand = positive_rand_val(100.01, grain_number as f64, 1.0);
+                    // Generate metadata for grains to process - TODO: could this be extracted?
+                    for grain_number in 0..grains_per_file {
+                        let grain_duration_rand =
+                            positive_rand_val(0.1, grain_number as f64, 3000.0);
+                        // // minimum is 100 to avoid clicks
+                        let grain_duration =
+                            cmp::max(100, (grain_duration_rand * max_grain_duration) as u32);
+                        // let grain_duration = max_grain_duration;
 
-                                let mut read_start =
-                                    (read_rand * (wav_size - grain_duration) as f64) as u32;
+                        let read_rand = positive_rand_val(100.01, grain_number as f64, 1.0);
 
-                                if channel_count > 1 {
-                                    // this code ensures that offset is always a multiple of channel count
-                                    // to ensure that we're positioning the read head at the start of a sample
-                                    // since multi-channel wavs are interleaved.
-                                    read_start =
-                                        read_start - (read_start % channel_count as u32);
-                                }
+                        let mut read_start =
+                            (read_rand * (wav_size - grain_duration) as f64) as u32;
 
-                                min_read_start = cmp::min(min_read_start, read_start);
+                        if channel_count > 1 {
+                            // this code ensures that offset is always a multiple of channel count
+                            // to ensure that we're positioning the read head at the start of a sample
+                            // since multi-channel wavs are interleaved.
+                            read_start = read_start - (read_start % channel_count as u32);
+                        }
 
-                                let read_end = cmp::min(read_start + grain_duration, wav_size);
-                                max_read_end = cmp::max(max_read_end, read_end);
+                        min_read_start = cmp::min(min_read_start, read_start);
 
-                                let output_rand = positive_rand_val(10.01, grain_number as f64, 1.0);
-                                let output_start = (output_rand * (output_duration_samples - grain_duration as u64) as f64) as u32;
-                                let volume = positive_rand_val(200.01, output_start as f64, 200000.0) as f32;
-                                let pan = rand_val(0.01, output_start as f64, 10.0) as f32 * panning;
+                        let read_end = cmp::min(read_start + grain_duration, wav_size);
+                        max_read_end = cmp::max(max_read_end, read_end);
 
-                                let fade_window_size = grain_duration / 2;
+                        let output_rand = positive_rand_val(10.01, grain_number as f64, 1.0);
+                        let output_start = (output_rand
+                            * (output_duration_samples - grain_duration as u64) as f64)
+                            as u32;
+                        let volume =
+                            positive_rand_val(200.01, output_start as f64, 200000.0) as f32;
 
-                                let grain = Grain {
-                                    number: grain_number as u32,
-                                    read_start,
-                                    read_end,
-                                    output_start,
-                                    fade_window_size,
-                                    pan,
-                                    volume,
-                                    pitch: 0.0,
-                                };
+                        let fade_window_size = grain_duration / 2;
 
-                                grains_to_process.entry(read_start)
-                                    .or_insert_with(Vec::new).push(grain);
-                            };
+                        let pan = rand_val(0.01, output_start as f64, 10.0) as f32 * panning;
+                        // Use constant power pan law so that the
+                        // volume is the same regardless of pan position
+                        let pan_angle = (pan + 1.0) * 0.5 * FRAC_PI_2;
+                        let pan_left_multiplier = pan_angle.cos();
+                        let pan_right_multiplier = pan_angle.sin();
 
-                            wav_reader.seek(min_read_start).unwrap();
+                        let grain = Grain {
+                            number: grain_number as u32,
+                            read_start,
+                            read_end,
+                            output_start,
+                            fade_window_size,
+                            pan_left_multiplier,
+                            pan_right_multiplier,
+                            volume,
+                            pitch: 0.0,
+                        };
 
-                            let sample_reader: Box<dyn Iterator<Item = Result<f32>>> =
-                                if wav_spec.sample_format == hound::SampleFormat::Float {
-                                    Box::new(wav_reader.samples::<f32>())
-                                } else {
-                                    Box::new(
-                                        wav_reader
-                                            .samples::<i32>()
-                                            .map(|res| res.map(|s| s as f32 / volume_scale)),
-                                    )
-                                };
+                        grains_to_process
+                            .entry(read_start)
+                            .or_insert_with(Vec::new)
+                            .push(grain);
+                    }
 
-                            let sample_range_count = max_read_end - min_read_start;
-                            let samples: Vec<_> = sample_reader.take(sample_range_count as usize).collect();
+                    wav_reader.seek(min_read_start).unwrap();
 
-                            for (current_sample_index, sample) in (&samples).iter().enumerate() {
-                                match sample {
-                                    Ok(sample) => {
-                                        let current_sample_index = current_sample_index as u32 + min_read_start;
-                                        let is_left = current_sample_index % 2 == 0;
+                    let sample_reader: Box<dyn Iterator<Item = Result<f32>>> =
+                        if wav_spec.sample_format == hound::SampleFormat::Float {
+                            Box::new(wav_reader.samples::<f32>())
+                        } else {
+                            Box::new(
+                                wav_reader
+                                    .samples::<i32>()
+                                    .map(|res| res.map(|s| s as f32 / volume_scale)),
+                            )
+                        };
 
-                                        if grains_to_process.get(&current_sample_index).is_some() {
-                                            let grains = grains_to_process.remove(&current_sample_index).unwrap();
+                    let sample_range_count = max_read_end - min_read_start;
+                    let samples: Vec<_> = sample_reader.take(sample_range_count as usize).collect();
 
-                                            for grain in grains {
-                                                processing_grains.insert(grain.number, grain);
-                                            }
-                                        }
+                    for (current_sample_index, sample) in (&samples).iter().enumerate() {
+                        match sample {
+                            Ok(sample) => {
+                                let current_sample_index =
+                                    current_sample_index as u32 + min_read_start;
+                                let is_left = current_sample_index % 2 == 0;
 
-                                        if processed_grains.len() > 0 {
-                                            for grain_number in &processed_grains {
-                                                processing_grains.remove(grain_number);
-                                            }
+                                if grains_to_process.get(&current_sample_index).is_some() {
+                                    let grains =
+                                        grains_to_process.remove(&current_sample_index).unwrap();
 
-                                            processed_grains.clear();
-                                        }
-
-                                        for (_, grain) in &processing_grains {
-                                            if grain.read_end <= current_sample_index {
-                                                processed_grains.push(grain.number);
-
-                                                let count_was = grains_processed.fetch_add(1, Ordering::SeqCst);
-                                                if count_was % report_interval == 0 {
-                                                    println!(
-                                                        "percent complete: {}%",
-                                                        (count_was as f32 / grain_count as f32) * 100.0,
-                                                    );
-                                                }
-
-                                                continue;
-                                            }
-
-                                            let mut current_grain_write_offset = (grain.output_start + current_sample_index) as usize;
-                                            let current_grain_read_offset = current_sample_index - grain.read_start;
-                                            if channel_count == 1 {
-                                                current_grain_write_offset *= 2;
-                                            }
-
-                                            if current_grain_write_offset >= output.len() - 1 {
-                                                continue;
-                                            };
-
-                                            let fade_window_size = grain.fade_window_size;
-                                            let pan = grain.pan;
-
-                                            let fade = if current_grain_read_offset <= fade_window_size {
-                                                current_grain_read_offset as f32 / fade_window_size as f32
-                                            } else {
-                                                1.0 - (current_grain_read_offset - fade_window_size) as f32
-                                                    / fade_window_size as f32
-                                            };
-
-                                            let volume_rand = grain.volume;
-
-                                            let sample =
-                                                sample * volume_rand as f32 * fade;
-
-                                            if output[current_grain_write_offset] == f64::MAX
-                                                || output[current_grain_write_offset] == f64::MIN
-                                                    || output[current_grain_write_offset + 1] == f64::MAX
-                                                    || output[current_grain_write_offset + 1] == f64::MIN
-                                                    {
-                                                        println!("overflow");
-                                                        // TODO what if it subtracted if it hits the threshold? might sound wacky/cool
-                                                        break;
-                                                    }
-
-                                            if channel_count == 1 {
-                                                output[current_grain_write_offset] += sample as f64 * (1f64 - pan as f64);
-                                                output[current_grain_write_offset + 1] += sample as f64 * (1f64 + pan as f64);
-                                            } else {
-                                                let sample = if is_left {
-                                                    sample * (1f32 - pan)
-                                                } else {
-                                                    sample * (1f32 + pan)
-                                                };
-
-                                                output[current_grain_write_offset] += sample as f64;
-                                            }
-                                        }
+                                    for grain in grains {
+                                        processing_grains.insert(grain.number, grain);
                                     }
-                                    _ => {
+                                }
+
+                                if processed_grains.len() > 0 {
+                                    for grain_number in &processed_grains {
+                                        processing_grains.remove(grain_number);
+                                    }
+
+                                    processed_grains.clear();
+                                }
+
+                                for (_, grain) in &processing_grains {
+                                    if grain.read_end <= current_sample_index {
+                                        processed_grains.push(grain.number);
+
+                                        let count_was =
+                                            grains_processed.fetch_add(1, Ordering::SeqCst);
+                                        if count_was % report_interval == 0 {
+                                            println!(
+                                                "percent complete: {}%",
+                                                (count_was as f32 / grain_count as f32) * 100.0,
+                                            );
+                                        }
+
+                                        continue;
+                                    }
+
+                                    let mut current_grain_write_offset =
+                                        (grain.output_start + current_sample_index) as usize;
+                                    let current_grain_read_offset =
+                                        current_sample_index - grain.read_start;
+                                    if channel_count == 1 {
+                                        current_grain_write_offset *= 2;
+                                    }
+
+                                    if current_grain_write_offset >= output.len() - 1 {
+                                        continue;
+                                    };
+
+                                    let fade_window_size = grain.fade_window_size;
+
+                                    let fade = if current_grain_read_offset <= fade_window_size {
+                                        current_grain_read_offset as f32 / fade_window_size as f32
+                                    } else {
+                                        1.0 - (current_grain_read_offset - fade_window_size) as f32
+                                            / fade_window_size as f32
+                                    };
+
+                                    let volume_rand = grain.volume;
+
+                                    let sample = sample * volume_rand as f32 * fade;
+
+                                    if output[current_grain_write_offset] == f64::MAX
+                                        || output[current_grain_write_offset] == f64::MIN
+                                        || output[current_grain_write_offset + 1] == f64::MAX
+                                        || output[current_grain_write_offset + 1] == f64::MIN
+                                    {
+                                        println!("overflow");
+                                        // TODO what if it subtracted if it hits the threshold? might sound wacky/cool
                                         break;
+                                    }
+
+                                    let pan_left_multiplier = grain.pan_left_multiplier;
+                                    let pan_right_multiplier = grain.pan_right_multiplier;
+
+                                    if channel_count == 1 {
+                                        output[current_grain_write_offset] +=
+                                            (sample * pan_left_multiplier) as f64;
+                                        output[current_grain_write_offset + 1] +=
+                                            (sample * pan_right_multiplier) as f64;
+                                    } else {
+                                        let sample = if is_left {
+                                            sample * pan_left_multiplier
+                                        } else {
+                                            sample * pan_right_multiplier
+                                        };
+
+                                        output[current_grain_write_offset] += sample as f64;
                                     }
                                 }
                             }
-                        }
-                        Err(e) => {
-                            println!("Error opening wav file: {}", e);
+                            _ => {
+                                break;
+                            }
                         }
                     }
                 }
@@ -546,14 +585,15 @@ fn main() {
         .collect::<Vec<_>>();
 
     for path in wav_paths {
-        path_sender.send(path.clone()).unwrap();
-    };
+        path_sender.send(path.to_owned()).unwrap();
+    }
 
     drop(path_sender);
 
-    let outputs: Vec<Vec<f64>> = grain_threads.into_iter().map({ |handle|
-        handle.join().unwrap()
-    }).collect();
+    let outputs: Vec<Vec<f64>> = grain_threads
+        .into_iter()
+        .map({ |handle| handle.join().unwrap() })
+        .collect();
 
     let output_name = format!(
         "{}-{}.wav",
