@@ -13,6 +13,7 @@ use rand::thread_rng;
 use rand::Rng;
 use std::cmp;
 use std::collections::HashMap;
+use std::f32::consts::FRAC_PI_2;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -21,58 +22,9 @@ use std::thread;
 use std::time::Duration;
 use walkdir::DirEntry;
 use walkdir::WalkDir;
-use std::f32::consts::FRAC_PI_2;
 
-// straight from chatGPT - TODO: analyze and extract into separate file
-use std::collections::VecDeque;
-
-pub struct LookaheadCompander {
-    lookahead: usize,
-    threshold: f64,
-    attack_rate: f64,
-    release_rate: f64,
-    buffer: VecDeque<f64>,
-    env: f64,
-}
-
-impl LookaheadCompander {
-    pub fn new(lookahead: usize, threshold: f64, attack: f64, release: f64) -> Self {
-        Self {
-            lookahead,
-            threshold,
-            attack_rate: attack.recip(),
-            release_rate: release.recip(),
-            buffer: VecDeque::with_capacity(lookahead),
-            env: 0.0,
-        }
-    }
-
-    pub fn process(&mut self, input: &mut [f64]) {
-        for sample in input.iter_mut() {
-            self.buffer.push_back(*sample);
-
-            let level = sample.abs();
-            let rate = if level > self.env {
-                self.attack_rate
-            } else {
-                self.release_rate
-            };
-            self.env += rate * (level - self.env);
-
-            if self.buffer.len() >= self.lookahead {
-                let delayed = self.buffer.pop_front().unwrap();
-
-                let gain = if self.env > self.threshold {
-                    self.threshold / self.env
-                } else {
-                    1.0
-                };
-
-                *sample = delayed * gain;
-            }
-        }
-    }
-}
+mod lookahead_compander;
+use lookahead_compander::LookaheadCompander;
 
 #[derive(Parser)]
 #[command(
@@ -161,7 +113,7 @@ struct Args {
 
     #[arg(
         long = "filter",
-        help = "Filter files in input directory by file name. (e.g. *.wav)"
+        help = "Filter files in input directory by file name. (e.g. _(A|B) will only include file namess including either _A or _B). Uses Rust regex syntax: https://docs.rs/regex/latest/regex/#syntax."
     )]
     filter: Option<String>,
 }
@@ -296,15 +248,15 @@ fn main() {
     let rand_speed: f64 = matches.rand_speed.unwrap_or(0.0001).abs();
     let use_diffused_random = matches.diffused_random.unwrap_or(false);
     let file_filter = matches.filter.unwrap_or("".to_owned());
+    let file_filter_regex = regex::Regex::new(&file_filter).unwrap();
 
     let wav_paths: Vec<_> = WalkDir::new(input_dir.clone())
         .into_iter()
         .filter_entry(|p| {
             let file_name = p.file_name().to_str().unwrap();
-            p.file_type().is_dir() || (
-                file_name.ends_with(".wav") &&
-                file_filter.is_empty() || file_name.contains(&file_filter)
-            )
+            p.file_type().is_dir()
+                || (file_name.ends_with(".wav") && file_filter.is_empty()
+                    || file_filter_regex.is_match(p.path().to_str().unwrap()))
         })
         .filter_map(|f| f.ok())
         .filter(|f| {
@@ -316,6 +268,10 @@ fn main() {
     if wav_paths.len() == 0 {
         println!("No wav files found in input directory");
         return;
+    }
+
+    for path in &wav_paths {
+        println!("using: {}", path.path().to_str().unwrap());
     }
 
     let spec = WavSpec {
