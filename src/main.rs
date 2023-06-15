@@ -13,7 +13,6 @@ use rand::thread_rng;
 use rand::Rng;
 use std::cmp;
 use num_traits::{cast::FromPrimitive, float::Float};
-use std::collections::HashMap;
 use std::f32::consts::FRAC_PI_2;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -24,6 +23,8 @@ use std::time::Duration;
 use std::fmt::Display;
 use walkdir::DirEntry;
 use walkdir::WalkDir;
+use fnv::FnvBuildHasher;
+use indexmap::{IndexMap};
 
 mod lookahead_compander;
 use lookahead_compander::LookaheadCompander;
@@ -368,7 +369,7 @@ fn main() {
                         }
                     };
 
-                    let mut processing_grains = HashMap::<u32, Grain>::new();
+                    let mut processing_grains = IndexMap::<u32, Grain, FnvBuildHasher>::default();
                     let mut processed_grains = Vec::<u32>::new();
                     let mut min_read_start = 0;
                     let mut max_read_end = 0;
