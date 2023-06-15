@@ -12,6 +12,7 @@ use rand::distributions::uniform::SampleUniform;
 use rand::thread_rng;
 use rand::Rng;
 use std::cmp;
+use num_traits::{cast::FromPrimitive, float::Float};
 use std::collections::HashMap;
 use std::f32::consts::FRAC_PI_2;
 use std::path::PathBuf;
@@ -20,6 +21,7 @@ use std::sync::Arc;
 use std::sync::TryLockError;
 use std::thread;
 use std::time::Duration;
+use std::fmt::Display;
 use walkdir::DirEntry;
 use walkdir::WalkDir;
 
@@ -201,17 +203,13 @@ fn mix(outputs: &Vec<Vec<f64>>) -> Vec<f64> {
         mixed_output.push(sample);
     }
 
-    let normalized_factor = 1.0 / max_sample;
-
-    for i in 0..mixed_output.len() {
-        mixed_output[i] = mixed_output[i] * normalized_factor;
-    }
+    normalize(&mut mixed_output, Some(max_sample));
 
     // This doesn't care about stereo - so it just compands each sample but that's kinda ok
     let mut compander = LookaheadCompander::new(500, 0.03, 5000.0, 5000.0);
     compander.process(&mut mixed_output);
 
-    // normalize(&mut mixed_output);
+    normalize(&mut mixed_output, None);
     // let max_sample = mixed_output.iter().max_by(|a, b| a.total_cmp(b)).unwrap();
     // let normalized_factor = 1.0 / max_sample;
 
@@ -220,15 +218,32 @@ fn mix(outputs: &Vec<Vec<f64>>) -> Vec<f64> {
     mixed_output
 }
 
-fn normalize(buff: &mut Vec<f64>) {
-    let max_sample = buff
+fn max_sample<T>(buff: &Vec<T>) -> T
+    where T: Float + FromPrimitive + PartialOrd + Display {
+    buff
         .iter()
-        .max_by(|a, b| a.abs().total_cmp(&b.abs()))
-        .unwrap();
-    let normalized_factor = 1.0 / max_sample;
-    println!("normalized factor: {}", normalized_factor);
+        .max_by(|a, b| a.abs().partial_cmp(&b.abs()).unwrap_or(std::cmp::Ordering::Equal))
+        .unwrap()
+        .to_owned()
+}
 
-    buff.iter_mut().for_each(|s| *s = *s / normalized_factor);
+fn normalize<T>(buff: &mut Vec<T>, max: Option<T>)
+    where T: Float + FromPrimitive + PartialOrd + Display {
+    let max_sample = match max {
+        Some(max) => {
+            max
+        }
+        None => {
+            max_sample(buff)
+        }
+    };
+
+    let normalized_factor = T::from_f64(1.0).unwrap() / max_sample.to_owned();
+    // println!("normalized factor: {}", normalized_factor);
+
+    for s in buff.iter_mut() {
+        *s = *s * normalized_factor;
+    };
 }
 
 fn main() {
@@ -313,7 +328,8 @@ fn main() {
                 let perlin = Perlin::new(seed);
                 let ridged = RidgedMulti::<Perlin>::new(seed);
                 let fbm = Fbm::<Perlin>::new(seed);
-                let noise_gen = Blend::new(perlin, ridged, fbm);
+                // let noise_gen = Blend::new(perlin, ridged, fbm);
+                let noise_gen = PerlinSurflet::new(seed);
 
                 for path in path_receiver.iter() {
                     // already verified that files can be read as a part of initial scan so we just
@@ -330,9 +346,9 @@ fn main() {
                     // offset the lookup index because otherwise the random values
                     // are too similar between files even with different random seeds
                     // let noise_offset = rand::random::<f64>();
-                    let noise_offset = thread_rng().gen_range(0.0..1.0);
+                    let noise_offset = thread_rng().gen_range(0.0..10.0);
                     // actually now it sounds cool? lol
-                    // let noise_offset = 0.0;
+                    let noise_offset = 0.0;
 
                     let rand_val = |offset: f64, index: f64, scale: f64| {
                         if use_diffused_random {
@@ -359,6 +375,9 @@ fn main() {
 
                     // Generate metadata for grains to process - TODO: could this be extracted?
                     for grain_number in 0..grains_per_file {
+                        // TODO make this a CLI flag
+                        let grain_offset = thread_rng().gen_range(0.0..1.0);
+
                         let grain_duration_rand =
                             positive_rand_val(0.1, grain_number as f64, 3000.0);
                         // // minimum is 100 to avoid clicks
@@ -383,16 +402,16 @@ fn main() {
                         let read_end = cmp::min(read_start + grain_duration, wav_size);
                         max_read_end = cmp::max(max_read_end, read_end);
 
-                        let output_rand = positive_rand_val(10.01, grain_number as f64, 1.0);
+                        let output_rand = positive_rand_val(10.01 + grain_offset, grain_number as f64, 1.0);
                         let output_start = (output_rand
                             * (output_duration_samples - grain_duration as u64) as f64)
                             as u32;
                         let volume =
-                            positive_rand_val(200.01, output_start as f64, 200000.0) as f32;
+                            positive_rand_val(200.01 + grain_offset, output_start as f64, 200000.0) as f32;
 
                         let fade_window_size = grain_duration / 2;
 
-                        let pan = rand_val(0.01, output_start as f64, 10.0) as f32 * panning;
+                        let pan = rand_val(0.01 + grain_offset, output_start as f64, 10.0) as f32 * panning;
                         // Use constant power pan law so that the
                         // volume is the same regardless of pan position
                         let pan_angle = (pan + 1.0) * 0.5 * FRAC_PI_2;
@@ -431,110 +450,106 @@ fn main() {
                         };
 
                     let sample_range_count = max_read_end - min_read_start;
-                    let samples: Vec<_> = sample_reader.take(sample_range_count as usize).collect();
+                    let samples: Vec<_> = sample_reader
+                        .take(sample_range_count as usize)
+                        .filter_map(|s| s.ok())
+                        .collect();
+
+                    let normalizing_factor = 1.0 / max_sample(&samples);
 
                     for (current_sample_index, sample) in (&samples).iter().enumerate() {
-                        match sample {
-                            Ok(sample) => {
-                                let current_sample_index =
-                                    current_sample_index as u32 + min_read_start;
-                                let is_left = current_sample_index % 2 == 0;
+                        let current_sample_index = current_sample_index as u32 + min_read_start;
+                        let is_left = current_sample_index % 2 == 0;
+                        let sample = sample * normalizing_factor;
 
-                                if grains_to_process.get(&current_sample_index).is_some() {
-                                    let grains =
-                                        grains_to_process.remove(&current_sample_index).unwrap();
+                        if grains_to_process.get(&current_sample_index).is_some() {
+                            let grains = grains_to_process.remove(&current_sample_index).unwrap();
 
-                                    for grain in grains {
-                                        processing_grains.insert(grain.number, grain);
-                                    }
-                                }
-
-                                if processed_grains.len() > 0 {
-                                    for grain_number in &processed_grains {
-                                        processing_grains.remove(grain_number);
-                                    }
-
-                                    processed_grains.clear();
-                                }
-
-                                for (_, grain) in &processing_grains {
-                                    if grain.read_end <= current_sample_index {
-                                        processed_grains.push(grain.number);
-
-                                        let count_was =
-                                            grains_processed.fetch_add(1, Ordering::SeqCst);
-                                        if count_was % report_interval == 0 {
-                                            println!(
-                                                "percent complete: {}%",
-                                                (count_was as f32 / grain_count as f32) * 100.0,
-                                            );
-                                        }
-
-                                        continue;
-                                    }
-
-                                    let mut current_grain_write_offset =
-                                        (grain.output_start + current_sample_index) as usize;
-                                    let current_grain_read_offset =
-                                        current_sample_index - grain.read_start;
-                                    if channel_count == 1 {
-                                        current_grain_write_offset *= 2;
-                                    }
-
-                                    if current_grain_write_offset >= output.len() - 1 {
-                                        continue;
-                                    };
-
-                                    let fade_window_size = grain.fade_window_size;
-
-                                    let fade = if current_grain_read_offset <= fade_window_size {
-                                        current_grain_read_offset as f32 / fade_window_size as f32
-                                    } else {
-                                        1.0 - (current_grain_read_offset - fade_window_size) as f32
-                                            / fade_window_size as f32
-                                    };
-
-                                    let volume_rand = grain.volume;
-
-                                    let sample = sample * volume_rand as f32 * fade;
-
-                                    if output[current_grain_write_offset] == f64::MAX
-                                        || output[current_grain_write_offset] == f64::MIN
-                                        || output[current_grain_write_offset + 1] == f64::MAX
-                                        || output[current_grain_write_offset + 1] == f64::MIN
-                                    {
-                                        println!("overflow");
-                                        // TODO what if it subtracted if it hits the threshold? might sound wacky/cool
-                                        break;
-                                    }
-
-                                    let pan_left_multiplier = grain.pan_left_multiplier;
-                                    let pan_right_multiplier = grain.pan_right_multiplier;
-
-                                    if channel_count == 1 {
-                                        output[current_grain_write_offset] +=
-                                            (sample * pan_left_multiplier) as f64;
-                                        output[current_grain_write_offset + 1] +=
-                                            (sample * pan_right_multiplier) as f64;
-                                    } else {
-                                        let sample = if is_left {
-                                            sample * pan_left_multiplier
-                                        } else {
-                                            sample * pan_right_multiplier
-                                        };
-
-                                        output[current_grain_write_offset] += sample as f64;
-                                    }
-                                }
+                            for grain in grains {
+                                processing_grains.insert(grain.number, grain);
                             }
-                            _ => {
+                        }
+
+                        if processed_grains.len() > 0 {
+                            for grain_number in &processed_grains {
+                                processing_grains.remove(grain_number);
+                            }
+
+                            processed_grains.clear();
+                        }
+
+                        for (_, grain) in &processing_grains {
+                            if grain.read_end <= current_sample_index {
+                                processed_grains.push(grain.number);
+
+                                let count_was = grains_processed.fetch_add(1, Ordering::SeqCst);
+                                if count_was % report_interval == 0 {
+                                    println!(
+                                        "percent complete: {}%",
+                                        (count_was as f32 / grain_count as f32) * 100.0,
+                                    );
+                                }
+
+                                continue;
+                            }
+
+                            let mut current_grain_write_offset =
+                                (grain.output_start + current_sample_index) as usize;
+                            let current_grain_read_offset = current_sample_index - grain.read_start;
+                            if channel_count == 1 {
+                                current_grain_write_offset *= 2;
+                            }
+
+                            if current_grain_write_offset >= output.len() - 1 {
+                                continue;
+                            };
+
+                            let fade_window_size = grain.fade_window_size;
+
+                            let fade = if current_grain_read_offset <= fade_window_size {
+                                current_grain_read_offset as f32 / fade_window_size as f32
+                            } else {
+                                1.0 - (current_grain_read_offset - fade_window_size) as f32
+                                    / fade_window_size as f32
+                            };
+
+                            let volume_rand = grain.volume;
+
+                            let sample = sample * volume_rand as f32 * fade;
+
+                            if output[current_grain_write_offset] == f64::MAX
+                                || output[current_grain_write_offset] == f64::MIN
+                                || output[current_grain_write_offset + 1] == f64::MAX
+                                || output[current_grain_write_offset + 1] == f64::MIN
+                            {
+                                println!("overflow");
+                                // TODO what if it subtracted if it hits the threshold? might sound wacky/cool
                                 break;
+                            }
+
+                            let pan_left_multiplier = grain.pan_left_multiplier;
+                            let pan_right_multiplier = grain.pan_right_multiplier;
+
+                            if channel_count == 1 {
+                                output[current_grain_write_offset] +=
+                                    (sample * pan_left_multiplier) as f64;
+                                output[current_grain_write_offset + 1] +=
+                                    (sample * pan_right_multiplier) as f64;
+                            } else {
+                                let sample = if is_left {
+                                    sample * pan_left_multiplier
+                                } else {
+                                    sample * pan_right_multiplier
+                                };
+
+                                output[current_grain_write_offset] += sample as f64;
                             }
                         }
                     }
                 }
 
-                println!("grain thread exiting");
+                // let mut compander = LookaheadCompander::new(500, 0.08, 5000.0, 5000.0);
+                // compander.process(&mut output);
                 output
             })
         })

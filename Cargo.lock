@@ -232,6 +232,7 @@ dependencies = [
  "crossbeam-channel",
  "hound",
  "noise",
+ "num-traits",
  "rand 0.8.5",
  "range-lock",
  "rayon",

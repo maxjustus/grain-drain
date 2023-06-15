@@ -10,6 +10,7 @@ clap = { version = "4.2.7", features = ["derive"] }
 crossbeam-channel = "0.5.8"
 hound = "3.5.0"
 noise = "0.8.2"
+num-traits = "0.2.15"
 rand = "0.8.5"
 range-lock = "0.2.3"
 rayon = "1.7.0"
