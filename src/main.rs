@@ -24,7 +24,10 @@ use std::fmt::Display;
 use walkdir::DirEntry;
 use walkdir::WalkDir;
 use fnv::FnvBuildHasher;
-use indexmap::{IndexMap};
+use indexmap::IndexMap;
+use memmap2::MmapOptions;
+use std::io::Cursor;
+use std::fs::File;
 
 mod lookahead_compander;
 use lookahead_compander::LookaheadCompander;
@@ -336,7 +339,10 @@ fn main() {
                 for path in path_receiver.iter() {
                     // already verified that files can be read as a part of initial scan so we just
                     // unwrap
-                    let mut wav_reader = WavReader::open(path.path()).unwrap();
+                    let file = File::open(path.path()).unwrap();
+                    let mmap = unsafe { MmapOptions::new().map(&file).unwrap() };
+                    let file_reader = Cursor::new(mmap);
+                    let mut wav_reader = WavReader::new(file_reader).unwrap();
 
                     let wav_size = wav_reader.len();
                     let wav_spec = wav_reader.spec();
