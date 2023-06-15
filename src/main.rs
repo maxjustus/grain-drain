@@ -446,12 +446,17 @@ fn main() {
                         };
 
                     let sample_range_count = max_read_end - min_read_start;
+                    let mut max_sample_val = 0.0;
                     let samples: Vec<_> = sample_reader
                         .take(sample_range_count as usize)
                         .filter_map(|s| s.ok())
+                        .map(|s| {
+                            max_sample_val = max_sample_val.max(s.abs());
+                            s
+                        })
                         .collect();
 
-                    let normalizing_factor = 1.0 / max_sample(&samples);
+                    let normalizing_factor = 1.0 / max_sample_val;
 
                     for (current_sample_index, sample) in (&samples).iter().enumerate() {
                         let current_sample_index = current_sample_index as u32 + min_read_start;
