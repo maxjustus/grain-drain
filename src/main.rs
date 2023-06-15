@@ -185,17 +185,17 @@ struct Grain {
     pitch: f32,
 }
 
-fn mix(outputs: &Vec<Vec<f64>>) -> Vec<f64> {
+fn mix(outputs: &Vec<Vec<f32>>) -> Vec<f32> {
     let output_duration_samples = outputs[0].len();
-    let mut mixed_output: Vec<f64> = Vec::with_capacity(output_duration_samples as usize);
+    let mut mixed_output: Vec<f32> = Vec::with_capacity(output_duration_samples as usize);
 
     // Writing output to file
     let mut max_sample = 0.0;
     for i in 0..output_duration_samples {
-        let mut sample: f64 = 0.0;
+        let mut sample: f32 = 0.0;
 
         for output in outputs {
-            sample += output[i as usize] as f64;
+            sample += output[i as usize];
         }
 
         if sample.abs() > max_sample {
@@ -324,7 +324,7 @@ fn main() {
             let grains_processed = grains_processed.clone();
 
             std::thread::spawn(move || {
-                let mut output: Vec<f64> = Vec::with_capacity(output_duration_samples as usize);
+                let mut output: Vec<f32> = Vec::with_capacity(output_duration_samples as usize);
                 output.resize(output_duration_samples as usize, 0.0);
 
                 let perlin = Perlin::new(seed);
@@ -457,6 +457,7 @@ fn main() {
                         .collect();
 
                     let normalizing_factor = 1.0 / max_sample_val;
+                    let write_limit = output.len() - 1;
 
                     for (current_sample_index, sample) in (&samples).iter().enumerate() {
                         let current_sample_index = current_sample_index as u32 + min_read_start;
@@ -502,7 +503,7 @@ fn main() {
                                 current_grain_write_offset *= 2;
                             }
 
-                            if current_grain_write_offset >= output.len() - 1 {
+                            if current_grain_write_offset >= write_limit {
                                 continue;
                             };
 
@@ -519,10 +520,13 @@ fn main() {
 
                             let sample = sample * volume_rand as f32 * fade;
 
-                            if output[current_grain_write_offset] == f64::MAX
-                                || output[current_grain_write_offset] == f64::MIN
-                                || output[current_grain_write_offset + 1] == f64::MAX
-                                || output[current_grain_write_offset + 1] == f64::MIN
+                            let left_sample = output[current_grain_write_offset];
+                            let right_sample = output[current_grain_write_offset + 1];
+
+                            if left_sample == f32::MAX
+                                || left_sample == f32::MIN
+                                || right_sample == f32::MAX
+                                || right_sample == f32::MIN
                             {
                                 println!("overflow");
                                 // TODO what if it subtracted if it hits the threshold? might sound wacky/cool
@@ -533,18 +537,18 @@ fn main() {
                             let pan_right_multiplier = grain.pan_right_multiplier;
 
                             if channel_count == 1 {
-                                output[current_grain_write_offset] +=
-                                    (sample * pan_left_multiplier) as f64;
-                                output[current_grain_write_offset + 1] +=
-                                    (sample * pan_right_multiplier) as f64;
+                                output[current_grain_write_offset] =
+                                    sample.mul_add(pan_left_multiplier, left_sample as f32);
+                                output[current_grain_write_offset + 1] =
+                                    sample.mul_add(pan_right_multiplier, right_sample as f32);
                             } else {
-                                let sample = if is_left {
-                                    sample * pan_left_multiplier
+                                let pan_multiplier = if is_left {
+                                    pan_left_multiplier
                                 } else {
-                                    sample * pan_right_multiplier
+                                    pan_right_multiplier
                                 };
 
-                                output[current_grain_write_offset] += sample as f64;
+                                output[current_grain_write_offset] = sample.mul_add(pan_multiplier, left_sample as f32);
                             }
                         }
                     }
@@ -563,7 +567,7 @@ fn main() {
 
     drop(path_sender);
 
-    let outputs: Vec<Vec<f64>> = grain_threads
+    let outputs: Vec<Vec<f32>> = grain_threads
         .into_iter()
         .map({ |handle| handle.join().unwrap() })
         .collect();

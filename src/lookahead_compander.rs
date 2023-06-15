@@ -3,15 +3,15 @@ use std::collections::VecDeque;
 
 pub struct LookaheadCompander {
     lookahead: usize,
-    threshold: f64,
-    attack_rate: f64,
-    release_rate: f64,
-    buffer: VecDeque<f64>,
-    env: f64,
+    threshold: f32,
+    attack_rate: f32,
+    release_rate: f32,
+    buffer: VecDeque<f32>,
+    env: f32,
 }
 
 impl LookaheadCompander {
-    pub fn new(lookahead: usize, threshold: f64, attack: f64, release: f64) -> Self {
+    pub fn new(lookahead: usize, threshold: f32, attack: f32, release: f32) -> Self {
         Self {
             lookahead,
             threshold,
@@ -22,7 +22,7 @@ impl LookaheadCompander {
         }
     }
 
-    pub fn process(&mut self, input: &mut [f64]) {
+    pub fn process(&mut self, input: &mut [f32]) {
         for sample in input.iter_mut() {
             self.buffer.push_back(*sample);
 
