@@ -171,6 +171,7 @@ fn generate_random_string(length: usize) -> String {
 }
 
 #[derive(Debug)]
+#[derive(Copy, Clone)]
 struct Grain {
     number: u32,
     read_start: u32,
@@ -367,14 +368,12 @@ fn main() {
                         }
                     };
 
-                    let mut grains_to_process = HashMap::<u32, Vec<Grain>>::new();
                     let mut processing_grains = HashMap::<u32, Grain>::new();
                     let mut processed_grains = Vec::<u32>::new();
                     let mut min_read_start = 0;
                     let mut max_read_end = 0;
 
-                    // Generate metadata for grains to process - TODO: could this be extracted?
-                    for grain_number in 0..grains_per_file {
+                    let mut grains_to_process = (0..grains_per_file).into_iter().map(|grain_number| {
                         // TODO make this a CLI flag
                         let grain_offset = thread_rng().gen_range(0.0..1.0);
 
@@ -418,7 +417,7 @@ fn main() {
                         let pan_left_multiplier = pan_angle.cos();
                         let pan_right_multiplier = pan_angle.sin();
 
-                        let grain = Grain {
+                        Grain {
                             number: grain_number as u32,
                             read_start,
                             read_end,
@@ -428,13 +427,9 @@ fn main() {
                             pan_right_multiplier,
                             volume,
                             pitch: 0.0,
-                        };
-
-                        grains_to_process
-                            .entry(read_start)
-                            .or_insert_with(Vec::new)
-                            .push(grain);
-                    }
+                        }
+                    }).collect::<Vec<_>>();
+                    grains_to_process.sort_by(|a, b| b.read_start.cmp(&a.read_start));
 
                     wav_reader.seek(min_read_start).unwrap();
 
@@ -462,11 +457,12 @@ fn main() {
                         let is_left = current_sample_index % 2 == 0;
                         let sample = sample * normalizing_factor;
 
-                        if grains_to_process.get(&current_sample_index).is_some() {
-                            let grains = grains_to_process.remove(&current_sample_index).unwrap();
-
-                            for grain in grains {
+                        while let Some(grain) = grains_to_process.last().cloned() {
+                            if grain.read_start == current_sample_index  {
+                                grains_to_process.pop();
                                 processing_grains.insert(grain.number, grain);
+                            } else {
+                                break;
                             }
                         }
 
