@@ -305,11 +305,24 @@ fn main() {
 
     let output_duration_samples = (output_duration * spec.sample_rate as f32 * 2.0) as u64;
 
-    let grains_per_file = grain_count / wav_paths.len();
+    let mut grains_per_file = grain_count / wav_paths.len();
+
+    let file_enqueue_times = (grains_per_file / 10000).max(1);
+
+    // we limit to 10k grains per file to avoid blowing up memory
+    // pre-allocating grains before processing file. 10k seems to
+    // be a sweet spot performance wise.
+    if grains_per_file > 10000 {
+        grains_per_file = 10000;
+    }
+
+    println!("file_enqueue_times: {}", file_enqueue_times);
+
     println!(
         "grain_count: {}, grains_per_file: {}",
         grain_count, grains_per_file
     );
+
     let (path_sender, path_receiver) = bounded::<DirEntry>(1000);
 
     let num_cpus = std::thread::available_parallelism().unwrap().get();
@@ -330,15 +343,16 @@ fn main() {
                 let mut output: Vec<f32> = Vec::with_capacity(output_duration_samples as usize);
                 output.resize(output_duration_samples as usize, 0.0);
 
-                let perlin = Perlin::new(seed);
+                // let perlin = Perlin::new(seed);
                 let ridged = RidgedMulti::<Perlin>::new(seed);
                 let fbm = Fbm::<Perlin>::new(seed);
                 // let noise_gen = Blend::new(perlin, ridged, fbm);
                 let noise_gen = PerlinSurflet::new(seed);
 
                 for path in path_receiver.iter() {
-                    // already verified that files can be read as a part of initial scan so we just
-                    // unwrap
+                    // we've already verified that files can be read as a
+                    // part of initial scan so we just unwrap
+ 
                     let file = File::open(path.path()).unwrap();
                     let mmap = unsafe { MmapOptions::new().map(&file).unwrap() };
                     let file_reader = Cursor::new(mmap);
@@ -354,7 +368,7 @@ fn main() {
                     // offset the lookup index because otherwise the random values
                     // are too similar between files even with different random seeds
                     // let noise_offset = rand::random::<f64>();
-                    let noise_offset = thread_rng().gen_range(0.0..10.0);
+                    // let noise_offset = thread_rng().gen_range(0.0..10.0);
                     // actually now it sounds cool? lol
                     let noise_offset = 0.0;
 
@@ -382,7 +396,7 @@ fn main() {
 
                     let mut grains_to_process = (0..grains_per_file).into_iter().map(|grain_number| {
                         // TODO make this a CLI flag
-                        let grain_offset = thread_rng().gen_range(0.0..1.0);
+                        let grain_offset = thread_rng().gen_range(0.0..0.001);
 
                         let grain_duration_rand =
                             positive_rand_val(0.1, grain_number as f64, 3000.0);
@@ -568,14 +582,16 @@ fn main() {
         .collect::<Vec<_>>();
 
     for path in wav_paths {
-        path_sender.send(path.to_owned()).unwrap();
+        for _ in 0..file_enqueue_times {
+            path_sender.send(path.to_owned()).unwrap();
+        }
     }
 
     drop(path_sender);
 
     let outputs: Vec<Vec<f32>> = grain_threads
         .into_iter()
-        .map({ |handle| handle.join().unwrap() })
+        .map(|handle| handle.join().unwrap())
         .collect();
 
     let output_name = format!(
