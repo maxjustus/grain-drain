@@ -9,7 +9,7 @@ use crossbeam_channel::bounded;
 use fnv::FnvBuildHasher;
 use hound::*;
 use indexmap::IndexMap;
-use memmap2::{MmapOptions, Mmap};
+use memmap2::{Mmap, MmapOptions};
 use noise::{Blend, Fbm, NoiseFn, Perlin, PerlinSurflet, RidgedMulti, Seedable};
 use rand::thread_rng;
 use rand::Rng;
@@ -22,6 +22,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use walkdir::DirEntry;
 use walkdir::WalkDir;
+use wide::f32x8;
 
 mod lookahead_compander;
 use lookahead_compander::LookaheadCompander;
@@ -176,8 +177,7 @@ struct Grain {
     output_start: u32,
     fade_window_size: u32,
     fade_window_coefficient: f32,
-    pan_left_multiplier: f32,
-    pan_right_multiplier: f32,
+    simd_pan_multipliers: f32x8,
     volume: f32,
     pitch: f32,
 }
@@ -224,8 +224,6 @@ fn max_sample(buff: &Vec<f32>) -> f32 {
         .to_owned()
 }
 
-use wide::f32x4;
-
 fn normalize(buff: &mut Vec<f32>, max: Option<f32>) {
     let max_sample = match max {
         Some(max) => max,
@@ -237,17 +235,13 @@ fn normalize(buff: &mut Vec<f32>, max: Option<f32>) {
     }
     let normalized_factor = 1.0 / max_sample;
 
-    // Creating a vectorized version of the normalization factor
-    let vec_normalized_factor = f32x4::splat(normalized_factor);
-
-    let len = buff.len() / 4 * 4; // to avoid out of bounds errors
+    let len = buff.len() / 8 * 8; // to avoid out of bounds errors
     let (chunks, remainder) = buff.split_at_mut(len);
 
-    for s in chunks.chunks_exact_mut(4) {
-        let mut vec = f32x4::from(s.as_ref());
-        vec *= vec_normalized_factor;
-        let vec = vec.to_array();
-        s.copy_from_slice(&vec);
+    for s in chunks.chunks_exact_mut(8) {
+        let mut vec = f32x8::from(s.as_ref());
+        vec = vec * normalized_factor;
+        s.copy_from_slice(&vec.to_array());
     }
 
     for s in remainder {
@@ -411,8 +405,10 @@ fn main() {
                             let grain_duration_rand =
                                 positive_rand_val(0.1, grain_number as f64, 3000.0);
                             // // minimum is 100 to avoid clicks
-                            let grain_duration =
+                            let mut grain_duration =
                                 cmp::max(100, (grain_duration_rand * max_grain_duration) as u32);
+                            // TODO: extract rounding to 4 into a function
+                            grain_duration = (grain_duration - (grain_duration % 8)).max(0);
                             // let grain_duration = max_grain_duration;
 
                             let read_rand = positive_rand_val(100.01, grain_number as f64, 1.0);
@@ -420,12 +416,7 @@ fn main() {
                             let mut read_start =
                                 (read_rand * (wav_size - grain_duration) as f64) as u32;
 
-                            if channel_count > 1 {
-                                // this code ensures that offset is always a multiple of channel count
-                                // to ensure that we're positioning the read head at the start of a sample
-                                // since multi-channel wavs are interleaved.
-                                read_start = read_start - (read_start % channel_count as u32);
-                            }
+                            read_start = (read_start - (read_start % 8)).max(0);
 
                             min_read_start = cmp::min(min_read_start, read_start);
 
@@ -455,6 +446,17 @@ fn main() {
                             let pan_left_multiplier = pan_angle.cos();
                             let pan_right_multiplier = pan_angle.sin();
 
+                            let simd_pan_multipliers = f32x8::from([
+                                pan_left_multiplier,
+                                pan_right_multiplier,
+                                pan_left_multiplier,
+                                pan_right_multiplier,
+                                pan_left_multiplier,
+                                pan_right_multiplier,
+                                pan_left_multiplier,
+                                pan_right_multiplier,
+                            ]);
+
                             Grain {
                                 number: grain_number as u32,
                                 read_start,
@@ -462,14 +464,14 @@ fn main() {
                                 output_start,
                                 fade_window_size,
                                 fade_window_coefficient,
-                                pan_left_multiplier,
-                                pan_right_multiplier,
+                                simd_pan_multipliers,
                                 volume,
                                 pitch: 0.0,
                             }
                         })
                         .collect::<Vec<_>>();
                     grains_to_process.sort_by(|a, b| b.read_start.cmp(&a.read_start));
+                    let fade_range = f32x8::from([0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
 
                     wav_reader.seek(min_read_start).unwrap();
 
@@ -499,10 +501,30 @@ fn main() {
                     let write_limit = output.len() - 1;
                     let is_mono = channel_count == 1;
 
-                    for (current_sample_index, sample) in (&samples).iter().enumerate() {
-                        let current_sample_index = current_sample_index as u32 + min_read_start;
-                        let sample = sample * normalizing_factor;
-                        let is_left = is_mono || current_sample_index % 2 == 0;
+                    for (current_sample_index, sample_group) in
+                        samples.chunks(if is_mono { 4 } else { 8 }).enumerate()
+                    {
+                        if is_mono && sample_group.len() != 4 || !is_mono && sample_group.len() != 8
+                        {
+                            break;
+                        }
+
+                        let current_sample_index =
+                            (current_sample_index as u32 + min_read_start) * 8;
+                        let sample_group = if is_mono {
+                            f32x8::from([
+                                sample_group[0],
+                                sample_group[0],
+                                sample_group[1],
+                                sample_group[1],
+                                sample_group[2],
+                                sample_group[2],
+                                sample_group[3],
+                                sample_group[3],
+                            ])
+                        } else {
+                            f32x8::from(sample_group)
+                        } * normalizing_factor;
 
                         while let Some(grain) = grains_to_process.last().cloned() {
                             if grain.read_start == current_sample_index {
@@ -536,50 +558,42 @@ fn main() {
                                 continue;
                             }
 
-                            let current_grain_write_offset = if is_mono {
-                                (grain.output_start + current_sample_index) as usize * 2
-                            } else {
-                                (grain.output_start + current_sample_index) as usize
-                            };
+                            let current_grain_write_offset =
+                                (grain.output_start + current_sample_index) as usize;
 
                             if current_grain_write_offset >= write_limit {
                                 continue;
                             };
 
                             let current_grain_read_offset = current_sample_index - grain.read_start;
-
                             let fade_window_size = grain.fade_window_size;
                             let fade_window_coefficient = grain.fade_window_coefficient;
 
+                            let mut base_fade = f32x8::splat(current_grain_read_offset as f32);
+                            base_fade += fade_range;
+
                             let fade = if current_grain_read_offset <= fade_window_size {
-                                current_grain_read_offset as f32 * fade_window_coefficient
+                                base_fade * fade_window_coefficient
                             } else {
-                                1.0 - ((current_grain_read_offset - fade_window_size) as f32 * fade_window_coefficient)
+                                1.0 - ((base_fade - fade_window_size as f32)
+                                    * fade_window_coefficient)
                             };
+
+                            // square grains
+                            // let fade = 1
 
                             let volume_rand = grain.volume;
 
-                            let sample = sample * volume_rand * fade;
+                            if let Some(output_samples) = output
+                                .get_mut(current_grain_write_offset..current_grain_write_offset + 8)
+                            {
+                                let output_samples_vec = f32x8::from(output_samples.as_ref());
 
-                            if is_mono {
-                                let left_sample = output[current_grain_write_offset];
-                                let right_sample = output[current_grain_write_offset + 1];
+                                let pan_multipliers = grain.simd_pan_multipliers;
 
-                                output[current_grain_write_offset] =
-                                    sample.mul_add(grain.pan_left_multiplier, left_sample);
-                                output[current_grain_write_offset + 1] =
-                                    sample.mul_add(grain.pan_right_multiplier, right_sample);
-                            } else {
-                                let output_sample = output[current_grain_write_offset];
-
-                                let pan_multiplier = if is_left {
-                                    grain.pan_left_multiplier
-                                } else {
-                                    grain.pan_right_multiplier
-                                };
-
-                                output[current_grain_write_offset] =
-                                    sample.mul_add(pan_multiplier, output_sample);
+                                let sample_group = output_samples_vec
+                                    + (sample_group * volume_rand * fade * pan_multipliers);
+                                output_samples.copy_from_slice(&sample_group.to_array());
                             }
                         }
                     }
