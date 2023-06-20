@@ -9,7 +9,7 @@ use crossbeam_channel::bounded;
 use fnv::FnvBuildHasher;
 use hound::*;
 use indexmap::IndexMap;
-use memmap2::MmapOptions;
+use memmap2::{MmapOptions, Mmap};
 use noise::{Blend, Fbm, NoiseFn, Perlin, PerlinSurflet, RidgedMulti, Seedable};
 use rand::thread_rng;
 use rand::Rng;
@@ -255,6 +255,13 @@ fn normalize(buff: &mut Vec<f32>, max: Option<f32>) {
     }
 }
 
+fn mmap_wav_reader(path: &DirEntry) -> Result<WavReader<Cursor<Mmap>>> {
+    let file = File::open(path.path())?;
+    let mmap = unsafe { MmapOptions::new().map(&file)? };
+    let file_reader = Cursor::new(mmap);
+    Ok(WavReader::new(file_reader)?)
+}
+
 fn main() {
     let matches = Args::parse();
 
@@ -285,7 +292,7 @@ fn main() {
         .filter_map(|f| f.ok())
         .filter(|f| {
             (file_percentage == 1.0 || thread_rng().gen_range(0.0..1.0) <= file_percentage)
-                && WavReader::open(f.path()).is_ok()
+                && mmap_wav_reader(f).is_ok()
         })
         .collect();
 
@@ -357,10 +364,7 @@ fn main() {
                     // we've already verified that files can be read as a
                     // part of initial scan so we just unwrap
 
-                    let file = File::open(path.path()).unwrap();
-                    let mmap = unsafe { MmapOptions::new().map(&file).unwrap() };
-                    let file_reader = Cursor::new(mmap);
-                    let mut wav_reader = WavReader::new(file_reader).unwrap();
+                    let mut wav_reader = mmap_wav_reader(&path).unwrap();
 
                     let wav_size = wav_reader.len();
                     let wav_spec = wav_reader.spec();
