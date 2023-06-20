@@ -6,28 +6,22 @@ extern crate rayon;
 use clap::Parser;
 use clap::{arg, command};
 use crossbeam_channel::bounded;
+use fnv::FnvBuildHasher;
 use hound::*;
+use indexmap::IndexMap;
+use memmap2::MmapOptions;
 use noise::{Blend, Fbm, NoiseFn, Perlin, PerlinSurflet, RidgedMulti, Seedable};
-use rand::distributions::uniform::SampleUniform;
 use rand::thread_rng;
 use rand::Rng;
 use std::cmp;
-use num_traits::{cast::FromPrimitive, float::Float};
 use std::f32::consts::FRAC_PI_2;
+use std::fs::File;
+use std::io::Cursor;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::sync::TryLockError;
-use std::thread;
-use std::time::Duration;
-use std::fmt::Display;
 use walkdir::DirEntry;
 use walkdir::WalkDir;
-use fnv::FnvBuildHasher;
-use indexmap::IndexMap;
-use memmap2::MmapOptions;
-use std::io::Cursor;
-use std::fs::File;
 
 mod lookahead_compander;
 use lookahead_compander::LookaheadCompander;
@@ -174,8 +168,7 @@ fn generate_random_string(length: usize) -> String {
     random_string
 }
 
-#[derive(Debug)]
-#[derive(Copy, Clone)]
+#[derive(Debug, Copy, Clone)]
 struct Grain {
     number: u32,
     read_start: u32,
@@ -223,32 +216,29 @@ fn mix(outputs: &Vec<Vec<f32>>) -> Vec<f32> {
     mixed_output
 }
 
-fn max_sample<T>(buff: &Vec<T>) -> T
-    where T: Float + FromPrimitive + PartialOrd + Display {
-    buff
-        .iter()
-        .max_by(|a, b| a.abs().partial_cmp(&b.abs()).unwrap_or(std::cmp::Ordering::Equal))
+fn max_sample(buff: &Vec<f32>) -> f32 {
+    buff.iter()
+        .max_by(|a, b| {
+            a.abs()
+                .partial_cmp(&b.abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
         .unwrap()
         .to_owned()
 }
 
-fn normalize<T>(buff: &mut Vec<T>, max: Option<T>)
-    where T: Float + FromPrimitive + PartialOrd + Display {
+fn normalize(buff: &mut Vec<f32>, max: Option<f32>) {
     let max_sample = match max {
-        Some(max) => {
-            max
-        }
-        None => {
-            max_sample(buff)
-        }
+        Some(max) => max,
+        None => max_sample(buff),
     };
 
-    let normalized_factor = T::from_f64(1.0).unwrap() / max_sample.to_owned();
+    let normalized_factor = 1.0 / max_sample.to_owned();
     // println!("normalized factor: {}", normalized_factor);
 
     for s in buff.iter_mut() {
         *s = *s * normalized_factor;
-    };
+    }
 }
 
 fn main() {
@@ -352,7 +342,7 @@ fn main() {
                 for path in path_receiver.iter() {
                     // we've already verified that files can be read as a
                     // part of initial scan so we just unwrap
- 
+
                     let file = File::open(path.path()).unwrap();
                     let mmap = unsafe { MmapOptions::new().map(&file).unwrap() };
                     let file_reader = Cursor::new(mmap);
@@ -394,62 +384,71 @@ fn main() {
                     let mut min_read_start = 0;
                     let mut max_read_end = 0;
 
-                    let mut grains_to_process = (0..grains_per_file).into_iter().map(|grain_number| {
-                        // TODO make this a CLI flag
-                        let grain_offset = thread_rng().gen_range(0.0..0.001);
+                    let mut grains_to_process = (0..grains_per_file)
+                        .into_iter()
+                        .map(|grain_number| {
+                            // TODO make this a CLI flag
+                            let grain_offset = thread_rng().gen_range(0.0..0.001);
 
-                        let grain_duration_rand =
-                            positive_rand_val(0.1, grain_number as f64, 3000.0);
-                        // // minimum is 100 to avoid clicks
-                        let grain_duration =
-                            cmp::max(100, (grain_duration_rand * max_grain_duration) as u32);
-                        // let grain_duration = max_grain_duration;
+                            let grain_duration_rand =
+                                positive_rand_val(0.1, grain_number as f64, 3000.0);
+                            // // minimum is 100 to avoid clicks
+                            let grain_duration =
+                                cmp::max(100, (grain_duration_rand * max_grain_duration) as u32);
+                            // let grain_duration = max_grain_duration;
 
-                        let read_rand = positive_rand_val(100.01, grain_number as f64, 1.0);
+                            let read_rand = positive_rand_val(100.01, grain_number as f64, 1.0);
 
-                        let mut read_start =
-                            (read_rand * (wav_size - grain_duration) as f64) as u32;
+                            let mut read_start =
+                                (read_rand * (wav_size - grain_duration) as f64) as u32;
 
-                        if channel_count > 1 {
-                            // this code ensures that offset is always a multiple of channel count
-                            // to ensure that we're positioning the read head at the start of a sample
-                            // since multi-channel wavs are interleaved.
-                            read_start = read_start - (read_start % channel_count as u32);
-                        }
+                            if channel_count > 1 {
+                                // this code ensures that offset is always a multiple of channel count
+                                // to ensure that we're positioning the read head at the start of a sample
+                                // since multi-channel wavs are interleaved.
+                                read_start = read_start - (read_start % channel_count as u32);
+                            }
 
-                        min_read_start = cmp::min(min_read_start, read_start);
+                            min_read_start = cmp::min(min_read_start, read_start);
 
-                        let read_end = cmp::min(read_start + grain_duration, wav_size);
-                        max_read_end = cmp::max(max_read_end, read_end);
+                            let read_end = cmp::min(read_start + grain_duration, wav_size);
+                            max_read_end = cmp::max(max_read_end, read_end);
 
-                        let output_rand = positive_rand_val(10.01 + grain_offset, grain_number as f64, 1.0);
-                        let output_start = (output_rand
-                            * (output_duration_samples - grain_duration as u64) as f64)
-                            as u32;
-                        let volume =
-                            positive_rand_val(200.01 + grain_offset, output_start as f64, 200000.0) as f32;
+                            let output_rand =
+                                positive_rand_val(10.01 + grain_offset, grain_number as f64, 1.0);
+                            let output_start = (output_rand
+                                * (output_duration_samples - grain_duration as u64) as f64)
+                                as u32;
+                            let volume = positive_rand_val(
+                                200.01 + grain_offset,
+                                output_start as f64,
+                                200000.0,
+                            ) as f32;
 
-                        let fade_window_size = grain_duration / 2;
+                            let fade_window_size = grain_duration / 2;
 
-                        let pan = rand_val(0.01 + grain_offset, output_start as f64, 10.0) as f32 * panning;
-                        // Use constant power pan law so that the
-                        // volume is the same regardless of pan position
-                        let pan_angle = (pan + 1.0) * 0.5 * FRAC_PI_2;
-                        let pan_left_multiplier = pan_angle.cos();
-                        let pan_right_multiplier = pan_angle.sin();
+                            let pan = rand_val(0.01 + grain_offset, output_start as f64, 10.0)
+                                as f32
+                                * panning;
+                            // Use constant power pan law so that the
+                            // volume is the same regardless of pan position
+                            let pan_angle = (pan + 1.0) * 0.5 * FRAC_PI_2;
+                            let pan_left_multiplier = pan_angle.cos();
+                            let pan_right_multiplier = pan_angle.sin();
 
-                        Grain {
-                            number: grain_number as u32,
-                            read_start,
-                            read_end,
-                            output_start,
-                            fade_window_size,
-                            pan_left_multiplier,
-                            pan_right_multiplier,
-                            volume,
-                            pitch: 0.0,
-                        }
-                    }).collect::<Vec<_>>();
+                            Grain {
+                                number: grain_number as u32,
+                                read_start,
+                                read_end,
+                                output_start,
+                                fade_window_size,
+                                pan_left_multiplier,
+                                pan_right_multiplier,
+                                volume,
+                                pitch: 0.0,
+                            }
+                        })
+                        .collect::<Vec<_>>();
                     grains_to_process.sort_by(|a, b| b.read_start.cmp(&a.read_start));
 
                     wav_reader.seek(min_read_start).unwrap();
@@ -466,7 +465,7 @@ fn main() {
                         };
 
                     let sample_range_count = max_read_end - min_read_start;
-                    let mut max_sample_val = 0.0;
+                    let mut max_sample_val: f32 = 0.0;
                     let samples: Vec<_> = sample_reader
                         .take(sample_range_count as usize)
                         .filter_map(|s| s.ok())
@@ -485,7 +484,7 @@ fn main() {
                         let sample = sample * normalizing_factor;
 
                         while let Some(grain) = grains_to_process.last().cloned() {
-                            if grain.read_start == current_sample_index  {
+                            if grain.read_start == current_sample_index {
                                 grains_to_process.pop();
                                 processing_grains.insert(grain.number, grain);
                             } else {
@@ -568,7 +567,8 @@ fn main() {
                                     pan_right_multiplier
                                 };
 
-                                output[current_grain_write_offset] = sample.mul_add(pan_multiplier, left_sample as f32);
+                                output[current_grain_write_offset] =
+                                    sample.mul_add(pan_multiplier, left_sample as f32);
                             }
                         }
                     }
