@@ -497,7 +497,6 @@ fn main() {
 
                     for (current_sample_index, sample) in (&samples).iter().enumerate() {
                         let current_sample_index = current_sample_index as u32 + min_read_start;
-                        let is_left = current_sample_index % 2 == 0;
                         let sample = sample * normalizing_factor;
 
                         while let Some(grain) = grains_to_process.last().cloned() {
@@ -557,36 +556,26 @@ fn main() {
 
                             let sample = sample * volume_rand as f32 * fade;
 
-                            let left_sample = output[current_grain_write_offset];
-                            let right_sample = output[current_grain_write_offset + 1];
-
-                            if left_sample == f32::MAX
-                                || left_sample == f32::MIN
-                                || right_sample == f32::MAX
-                                || right_sample == f32::MIN
-                            {
-                                println!("overflow");
-                                // TODO what if it subtracted if it hits the threshold? might sound wacky/cool
-                                break;
-                            }
-
-                            let pan_left_multiplier = grain.pan_left_multiplier;
-                            let pan_right_multiplier = grain.pan_right_multiplier;
-
                             if channel_count == 1 {
+                                let left_sample = output[current_grain_write_offset];
+                                let right_sample = output[current_grain_write_offset + 1];
+
                                 output[current_grain_write_offset] =
-                                    sample.mul_add(pan_left_multiplier, left_sample as f32);
+                                    sample.mul_add(grain.pan_left_multiplier, left_sample);
                                 output[current_grain_write_offset + 1] =
-                                    sample.mul_add(pan_right_multiplier, right_sample as f32);
+                                    sample.mul_add(grain.pan_right_multiplier, right_sample);
                             } else {
+                                let is_left = current_sample_index % 2 == 0;
+                                let output_sample = output[current_grain_write_offset];
+
                                 let pan_multiplier = if is_left {
-                                    pan_left_multiplier
+                                    grain.pan_left_multiplier
                                 } else {
-                                    pan_right_multiplier
+                                    grain.pan_right_multiplier
                                 };
 
                                 output[current_grain_write_offset] =
-                                    sample.mul_add(pan_multiplier, left_sample as f32);
+                                    sample.mul_add(pan_multiplier, output_sample);
                             }
                         }
                     }
