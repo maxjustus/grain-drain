@@ -532,16 +532,17 @@ fn main() {
                                 continue;
                             }
 
-                            let mut current_grain_write_offset =
-                                (grain.output_start + current_sample_index) as usize;
-                            let current_grain_read_offset = current_sample_index - grain.read_start;
-                            if channel_count == 1 {
-                                current_grain_write_offset *= 2;
-                            }
+                            let current_grain_write_offset = if channel_count == 1 {
+                                (grain.output_start + current_sample_index) as usize * 2
+                            } else {
+                                (grain.output_start + current_sample_index) as usize
+                            };
 
                             if current_grain_write_offset >= write_limit {
                                 continue;
                             };
+
+                            let current_grain_read_offset = current_sample_index - grain.read_start;
 
                             let fade_window_size = grain.fade_window_size;
 
