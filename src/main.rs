@@ -175,6 +175,7 @@ struct Grain {
     read_end: u32,
     output_start: u32,
     fade_window_size: u32,
+    fade_window_coefficient: f32,
     pan_left_multiplier: f32,
     pan_right_multiplier: f32,
     volume: f32,
@@ -439,6 +440,7 @@ fn main() {
                             ) as f32;
 
                             let fade_window_size = grain_duration / 2;
+                            let fade_window_coefficient = 1.0 / fade_window_size as f32;
 
                             let pan = rand_val(0.01 + grain_offset, output_start as f64, 10.0)
                                 as f32
@@ -455,6 +457,7 @@ fn main() {
                                 read_end,
                                 output_start,
                                 fade_window_size,
+                                fade_window_coefficient,
                                 pan_left_multiplier,
                                 pan_right_multiplier,
                                 volume,
@@ -490,10 +493,12 @@ fn main() {
 
                     let normalizing_factor = 1.0 / max_sample_val;
                     let write_limit = output.len() - 1;
+                    let is_mono = channel_count == 1;
 
                     for (current_sample_index, sample) in (&samples).iter().enumerate() {
                         let current_sample_index = current_sample_index as u32 + min_read_start;
                         let sample = sample * normalizing_factor;
+                        let is_left = is_mono || current_sample_index % 2 == 0;
 
                         while let Some(grain) = grains_to_process.last().cloned() {
                             if grain.read_start == current_sample_index {
@@ -527,7 +532,7 @@ fn main() {
                                 continue;
                             }
 
-                            let current_grain_write_offset = if channel_count == 1 {
+                            let current_grain_write_offset = if is_mono {
                                 (grain.output_start + current_sample_index) as usize * 2
                             } else {
                                 (grain.output_start + current_sample_index) as usize
@@ -540,19 +545,19 @@ fn main() {
                             let current_grain_read_offset = current_sample_index - grain.read_start;
 
                             let fade_window_size = grain.fade_window_size;
+                            let fade_window_coefficient = grain.fade_window_coefficient;
 
                             let fade = if current_grain_read_offset <= fade_window_size {
-                                current_grain_read_offset as f32 / fade_window_size as f32
+                                current_grain_read_offset as f32 * fade_window_coefficient
                             } else {
-                                1.0 - (current_grain_read_offset - fade_window_size) as f32
-                                    / fade_window_size as f32
+                                1.0 - ((current_grain_read_offset - fade_window_size) as f32 * fade_window_coefficient)
                             };
 
                             let volume_rand = grain.volume;
 
                             let sample = sample * volume_rand * fade;
 
-                            if channel_count == 1 {
+                            if is_mono {
                                 let left_sample = output[current_grain_write_offset];
                                 let right_sample = output[current_grain_write_offset + 1];
 
@@ -561,7 +566,6 @@ fn main() {
                                 output[current_grain_write_offset + 1] =
                                     sample.mul_add(grain.pan_right_multiplier, right_sample);
                             } else {
-                                let is_left = current_sample_index % 2 == 0;
                                 let output_sample = output[current_grain_write_offset];
 
                                 let pan_multiplier = if is_left {
