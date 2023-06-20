@@ -227,16 +227,33 @@ fn max_sample(buff: &Vec<f32>) -> f32 {
         .to_owned()
 }
 
+use wide::f32x4;
+
 fn normalize(buff: &mut Vec<f32>, max: Option<f32>) {
     let max_sample = match max {
         Some(max) => max,
         None => max_sample(buff),
     };
 
-    let normalized_factor = 1.0 / max_sample.to_owned();
-    // println!("normalized factor: {}", normalized_factor);
+    if max_sample == 0.0 {
+        return;
+    }
+    let normalized_factor = 1.0 / max_sample;
 
-    for s in buff.iter_mut() {
+    // Creating a vectorized version of the normalization factor
+    let vec_normalized_factor = f32x4::splat(normalized_factor);
+
+    let len = buff.len() / 4 * 4; // to avoid out of bounds errors
+    let (chunks, remainder) = buff.split_at_mut(len);
+
+    for s in chunks.chunks_exact_mut(4) {
+        let mut vec = f32x4::from(s.as_ref());
+        vec *= vec_normalized_factor;
+        let vec = vec.to_array();
+        s.copy_from_slice(&vec);
+    }
+
+    for s in remainder {
         *s = *s * normalized_factor;
     }
 }
