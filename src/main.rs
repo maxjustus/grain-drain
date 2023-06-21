@@ -11,8 +11,6 @@ use hound::*;
 use indexmap::IndexMap;
 use memmap2::{Mmap, MmapOptions};
 use noise::{Blend, Fbm, NoiseFn, Perlin, PerlinSurflet, RidgedMulti, Seedable};
-use rand::thread_rng;
-use rand::Rng;
 use std::cmp;
 use std::f32::consts::FRAC_PI_2;
 use std::fs::File;
@@ -117,6 +115,9 @@ struct Args {
         help = "Filter files in input directory by file name. (e.g. _(A|B) will only include file namess including either _A or _B). Uses Rust regex syntax: https://docs.rs/regex/latest/regex/#syntax."
     )]
     filter: Option<String>,
+
+    #[arg(long = "seed", help = "Random seed")]
+    seed: Option<u32>,
 }
 
 fn compute_grain_duration(wav_size: u32, channel_count: u16, grain_duration: u32) -> u32 {
@@ -158,13 +159,7 @@ fn parse_intervals(intervals: String) -> Vec<std::ops::Range<f32>> {
 }
 
 fn generate_random_string(length: usize) -> String {
-    let chars: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
-    let random_string: String = (0..length)
-        .map(|_| {
-            let idx = thread_rng().gen_range(0..chars.len());
-            chars[idx] as char
-        })
-        .collect();
+    let random_string: String = (0..length).map(|_| fastrand::alphabetic()).collect();
 
     random_string
 }
@@ -194,21 +189,21 @@ struct GrainConfig<'a, 'b> {
 
 fn gen_grain(config: GrainConfig) -> Grain {
     // TODO make this a CLI flag
-    let grain_offset = thread_rng().gen_range(0.0..0.001);
+    let grain_offset = fastrand::f64() * 0.001;
 
-    let grain_duration_rand =
-        (config.positive_rand_val)(0.1, config.grain_number as f64, 3000.0);
+    let grain_duration_rand = (config.positive_rand_val)(0.1, config.grain_number as f64, 3000.0);
     // // minimum is 100 to avoid clicks
-    let mut grain_duration =
-        cmp::max(100, (grain_duration_rand * config.max_grain_duration) as u32);
+    let mut grain_duration = cmp::max(
+        100,
+        (grain_duration_rand * config.max_grain_duration) as u32,
+    );
     // TODO: extract rounding to 4 into a function
     grain_duration = (grain_duration - (grain_duration % 8)).max(0);
     // let grain_duration = max_grain_duration;
 
     let read_rand = (config.positive_rand_val)(100.01, config.grain_number as f64, 1.0);
 
-    let mut read_start =
-        (read_rand * (config.wav_size - grain_duration) as f64) as u32;
+    let mut read_start = (read_rand * (config.wav_size - grain_duration) as f64) as u32;
 
     read_start = (read_start - (read_start % 8)).max(0);
 
@@ -216,21 +211,16 @@ fn gen_grain(config: GrainConfig) -> Grain {
 
     let output_rand =
         (config.positive_rand_val)(10.01 + grain_offset, config.grain_number as f64, 1.0);
-    let output_start = (output_rand
-        * (config.output_duration_samples - grain_duration as u64) as f64)
-        as u32;
-    let volume = (config.positive_rand_val)(
-        200.01 + grain_offset,
-        output_start as f64,
-        200000.0,
-    ) as f32;
+    let output_start =
+        (output_rand * (config.output_duration_samples - grain_duration as u64) as f64) as u32;
+    let volume =
+        (config.positive_rand_val)(200.01 + grain_offset, output_start as f64, 200000.0) as f32;
 
     let fade_window_size = grain_duration / 2;
     let fade_window_coefficient = 1.0 / fade_window_size as f32;
 
-    let pan = (config.rand_val)(0.01 + grain_offset, output_start as f64, 10.0)
-        as f32
-        * config.panning;
+    let pan =
+        (config.rand_val)(0.01 + grain_offset, output_start as f64, 10.0) as f32 * config.panning;
     // Use constant power pan law so that the
     // volume is the same regardless of pan position
     let pan_angle = (pan + 1.0) * 0.5 * FRAC_PI_2;
@@ -343,6 +333,7 @@ fn main() {
     let output_duration: f32 = matches.duration_in_sec.unwrap_or(100.0);
     let grain_size: u32 = matches.max_grain_size_in_samples.unwrap_or(8000);
     let grain_count: usize = matches.grain_count.unwrap_or(100000);
+    let seed: u32 = matches.seed.unwrap_or(rand::random::<u32>());
     let report_interval: usize = grain_count / 1000;
     let panning: f32 = matches.panning.unwrap_or(1.0).clamp(0.0, 1.0);
     let file_percentage: f32 = matches.file_percentage.unwrap_or(1.0).clamp(0.0, 1.0);
@@ -354,6 +345,8 @@ fn main() {
     let file_filter = matches.filter.unwrap_or("".to_owned());
     let file_filter_regex = regex::Regex::new(&file_filter).unwrap();
 
+    fastrand::seed(seed as u64);
+
     let wav_paths: Vec<_> = WalkDir::new(input_dir.clone())
         .into_iter()
         .filter_entry(|p| {
@@ -363,10 +356,7 @@ fn main() {
                     || file_filter_regex.is_match(p.path().to_str().unwrap()))
         })
         .filter_map(|f| f.ok())
-        .filter(|f| {
-            (file_percentage == 1.0 || thread_rng().gen_range(0.0..1.0) <= file_percentage)
-                && mmap_wav_reader(f).is_ok()
-        })
+        .filter(|f| (file_percentage == 1.0 || fastrand::bool()) && mmap_wav_reader(f).is_ok())
         .collect();
 
     if wav_paths.len() == 0 {
@@ -413,7 +403,6 @@ fn main() {
 
     let grains_processed = Arc::new(AtomicUsize::new(0));
 
-    let seed = rand::random::<u32>();
     // let noise_gen = PerlinSurflet::new(seed);
 
     let grain_threads = (0..num_cpus)
@@ -442,20 +431,19 @@ fn main() {
                     let wav_size = wav_reader.len();
                     let wav_spec = wav_reader.spec();
                     let channel_count = wav_spec.channels;
-                    let volume_scale = compute_volume_scale(wav_spec);
+                    let volume_scale = compute_volume_scale(wav_spec).recip();
                     let max_grain_duration =
                         compute_grain_duration(wav_size, channel_count, grain_size) as f64;
 
                     // offset the lookup index because otherwise the random values
                     // are too similar between files even with different random seeds
-                    // let noise_offset = rand::random::<f64>();
-                    // let noise_offset = thread_rng().gen_range(0.0..10.0);
+                    // let noise_offset = fastrand::f64() * 10.0;
                     // actually now it sounds cool? lol
                     let noise_offset = 0.0;
 
                     let rand_val = |offset: f64, index: f64, scale: f64| {
                         if use_diffused_random {
-                            thread_rng().gen_range(-1.0..1.0)
+                            fastrand::f64() * 2.0 - 1.0
                         } else {
                             noise_gen
                                 .get([offset + noise_offset, index as f64 / (scale / rand_speed)])
@@ -464,7 +452,7 @@ fn main() {
 
                     let positive_rand_val = |offset: f64, index: f64, scale: f64| {
                         if use_diffused_random {
-                            thread_rng().gen_range(0.0..1.0)
+                            fastrand::f64()
                         } else {
                             rand_val(offset, index, scale).abs()
                         }
@@ -485,7 +473,7 @@ fn main() {
                                 output_duration_samples,
                                 rand_val: &rand_val,
                                 positive_rand_val: &positive_rand_val,
-                                panning
+                                panning,
                             };
 
                             let grain = gen_grain(config);
@@ -504,10 +492,12 @@ fn main() {
                         if wav_spec.sample_format == hound::SampleFormat::Float {
                             Box::new(wav_reader.samples::<f32>())
                         } else {
+                            // TODO: figure out how to vectorize this - read in chunks of 8 samples
+                            // convert to f32x8 and then multiply by volume_scale
                             Box::new(
                                 wav_reader
                                     .samples::<i32>()
-                                    .map(|res| res.map(|s| s as f32 / volume_scale)),
+                                    .map(|res| res.map(|s| s as f32 * volume_scale)),
                             )
                         };
 
@@ -594,8 +584,8 @@ fn main() {
                             let fade_window_size = grain.fade_window_size;
                             let fade_window_coefficient = grain.fade_window_coefficient;
 
-                            let mut base_fade = f32x8::splat(current_grain_read_offset as f32);
-                            base_fade += fade_range;
+                            let base_fade =
+                                f32x8::splat(current_grain_read_offset as f32) + fade_range;
 
                             let fade = if current_grain_read_offset <= fade_window_size {
                                 base_fade * fade_window_coefficient
