@@ -182,6 +182,85 @@ struct Grain {
     pitch: f32,
 }
 
+struct GrainConfig<'a, 'b> {
+    wav_size: u32,
+    grain_number: usize,
+    panning: f32,
+    output_duration_samples: u64,
+    max_grain_duration: f64,
+    rand_val: &'a dyn Fn(f64, f64, f64) -> f64,
+    positive_rand_val: &'b dyn Fn(f64, f64, f64) -> f64,
+}
+
+fn gen_grain(config: GrainConfig) -> Grain {
+    // TODO make this a CLI flag
+    let grain_offset = thread_rng().gen_range(0.0..0.001);
+
+    let grain_duration_rand =
+        (config.positive_rand_val)(0.1, config.grain_number as f64, 3000.0);
+    // // minimum is 100 to avoid clicks
+    let mut grain_duration =
+        cmp::max(100, (grain_duration_rand * config.max_grain_duration) as u32);
+    // TODO: extract rounding to 4 into a function
+    grain_duration = (grain_duration - (grain_duration % 8)).max(0);
+    // let grain_duration = max_grain_duration;
+
+    let read_rand = (config.positive_rand_val)(100.01, config.grain_number as f64, 1.0);
+
+    let mut read_start =
+        (read_rand * (config.wav_size - grain_duration) as f64) as u32;
+
+    read_start = (read_start - (read_start % 8)).max(0);
+
+    let read_end = cmp::min(read_start + grain_duration, config.wav_size);
+
+    let output_rand =
+        (config.positive_rand_val)(10.01 + grain_offset, config.grain_number as f64, 1.0);
+    let output_start = (output_rand
+        * (config.output_duration_samples - grain_duration as u64) as f64)
+        as u32;
+    let volume = (config.positive_rand_val)(
+        200.01 + grain_offset,
+        output_start as f64,
+        200000.0,
+    ) as f32;
+
+    let fade_window_size = grain_duration / 2;
+    let fade_window_coefficient = 1.0 / fade_window_size as f32;
+
+    let pan = (config.rand_val)(0.01 + grain_offset, output_start as f64, 10.0)
+        as f32
+        * config.panning;
+    // Use constant power pan law so that the
+    // volume is the same regardless of pan position
+    let pan_angle = (pan + 1.0) * 0.5 * FRAC_PI_2;
+    let pan_left_multiplier = pan_angle.cos();
+    let pan_right_multiplier = pan_angle.sin();
+
+    let simd_pan_multipliers = f32x8::from([
+        pan_left_multiplier,
+        pan_right_multiplier,
+        pan_left_multiplier,
+        pan_right_multiplier,
+        pan_left_multiplier,
+        pan_right_multiplier,
+        pan_left_multiplier,
+        pan_right_multiplier,
+    ]);
+
+    Grain {
+        number: config.grain_number as u32,
+        read_start,
+        read_end,
+        output_start,
+        fade_window_size,
+        fade_window_coefficient,
+        simd_pan_multipliers,
+        volume,
+        pitch: 0.0,
+    }
+}
+
 fn mix(outputs: &Vec<Vec<f32>>) -> Vec<f32> {
     let output_duration_samples = outputs[0].len();
     let mut mixed_output: Vec<f32> = Vec::with_capacity(output_duration_samples as usize);
@@ -399,75 +478,21 @@ fn main() {
                     let mut grains_to_process = (0..grains_per_file)
                         .into_iter()
                         .map(|grain_number| {
-                            // TODO make this a CLI flag
-                            let grain_offset = thread_rng().gen_range(0.0..0.001);
+                            let config = GrainConfig {
+                                wav_size,
+                                grain_number,
+                                max_grain_duration,
+                                output_duration_samples,
+                                rand_val: &rand_val,
+                                positive_rand_val: &positive_rand_val,
+                                panning
+                            };
 
-                            let grain_duration_rand =
-                                positive_rand_val(0.1, grain_number as f64, 3000.0);
-                            // // minimum is 100 to avoid clicks
-                            let mut grain_duration =
-                                cmp::max(100, (grain_duration_rand * max_grain_duration) as u32);
-                            // TODO: extract rounding to 4 into a function
-                            grain_duration = (grain_duration - (grain_duration % 8)).max(0);
-                            // let grain_duration = max_grain_duration;
+                            let grain = gen_grain(config);
+                            min_read_start = cmp::min(min_read_start, grain.read_start);
+                            max_read_end = cmp::max(max_read_end, grain.read_end);
 
-                            let read_rand = positive_rand_val(100.01, grain_number as f64, 1.0);
-
-                            let mut read_start =
-                                (read_rand * (wav_size - grain_duration) as f64) as u32;
-
-                            read_start = (read_start - (read_start % 8)).max(0);
-
-                            min_read_start = cmp::min(min_read_start, read_start);
-
-                            let read_end = cmp::min(read_start + grain_duration, wav_size);
-                            max_read_end = cmp::max(max_read_end, read_end);
-
-                            let output_rand =
-                                positive_rand_val(10.01 + grain_offset, grain_number as f64, 1.0);
-                            let output_start = (output_rand
-                                * (output_duration_samples - grain_duration as u64) as f64)
-                                as u32;
-                            let volume = positive_rand_val(
-                                200.01 + grain_offset,
-                                output_start as f64,
-                                200000.0,
-                            ) as f32;
-
-                            let fade_window_size = grain_duration / 2;
-                            let fade_window_coefficient = 1.0 / fade_window_size as f32;
-
-                            let pan = rand_val(0.01 + grain_offset, output_start as f64, 10.0)
-                                as f32
-                                * panning;
-                            // Use constant power pan law so that the
-                            // volume is the same regardless of pan position
-                            let pan_angle = (pan + 1.0) * 0.5 * FRAC_PI_2;
-                            let pan_left_multiplier = pan_angle.cos();
-                            let pan_right_multiplier = pan_angle.sin();
-
-                            let simd_pan_multipliers = f32x8::from([
-                                pan_left_multiplier,
-                                pan_right_multiplier,
-                                pan_left_multiplier,
-                                pan_right_multiplier,
-                                pan_left_multiplier,
-                                pan_right_multiplier,
-                                pan_left_multiplier,
-                                pan_right_multiplier,
-                            ]);
-
-                            Grain {
-                                number: grain_number as u32,
-                                read_start,
-                                read_end,
-                                output_start,
-                                fade_window_size,
-                                fade_window_coefficient,
-                                simd_pan_multipliers,
-                                volume,
-                                pitch: 0.0,
-                            }
+                            grain
                         })
                         .collect::<Vec<_>>();
                     grains_to_process.sort_by(|a, b| b.read_start.cmp(&a.read_start));
