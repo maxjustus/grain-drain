@@ -118,6 +118,9 @@ struct Args {
 
     #[arg(long = "seed", help = "Random seed")]
     seed: Option<u32>,
+
+    #[arg(long = "rectify", help = "Rectify grains with random polarity")]
+    rectify: Option<bool>,
 }
 
 fn compute_grain_duration(wav_size: u32, channel_count: u16, grain_duration: u32) -> u32 {
@@ -174,6 +177,7 @@ struct Grain {
     fade_window_coefficient: f32,
     simd_pan_multipliers: f32x8,
     volume: f32,
+    polarity: i8,
     pitch: f32,
 }
 
@@ -185,6 +189,7 @@ struct GrainConfig<'a, 'b> {
     max_grain_duration: f64,
     rand_val: &'a dyn Fn(f64, f64, f64) -> f64,
     positive_rand_val: &'b dyn Fn(f64, f64, f64) -> f64,
+    rectify: bool,
 }
 
 fn gen_grain(config: GrainConfig) -> Grain {
@@ -238,6 +243,12 @@ fn gen_grain(config: GrainConfig) -> Grain {
         pan_right_multiplier,
     ]);
 
+    let polarity = if config.rectify {
+        if fastrand::bool() { 1 } else { -1 }
+    } else {
+        0
+    };
+
     Grain {
         number: config.grain_number as u32,
         read_start,
@@ -248,6 +259,7 @@ fn gen_grain(config: GrainConfig) -> Grain {
         simd_pan_multipliers,
         volume,
         pitch: 0.0,
+        polarity,
     }
 }
 
@@ -343,6 +355,7 @@ fn main() {
     let rand_speed: f64 = matches.rand_speed.unwrap_or(0.0001).abs();
     let use_diffused_random = matches.diffused_random.unwrap_or(false);
     let file_filter = matches.filter.unwrap_or("".to_owned());
+    let rectify = matches.rectify.unwrap_or(false);
     let file_filter_regex = regex::Regex::new(&file_filter).unwrap();
 
     fastrand::seed(seed as u64);
@@ -474,6 +487,7 @@ fn main() {
                                 rand_val: &rand_val,
                                 positive_rand_val: &positive_rand_val,
                                 panning,
+                                rectify,
                             };
 
                             let grain = gen_grain(config);
@@ -578,6 +592,12 @@ fn main() {
 
                             if current_grain_write_offset >= write_limit {
                                 continue;
+                            };
+
+                            let sample_group = if grain.polarity != 0 {
+                                sample_group.abs() * grain.polarity as f32
+                            } else {
+                                sample_group
                             };
 
                             let current_grain_read_offset = current_sample_index - grain.read_start;
