@@ -117,7 +117,7 @@ struct Args {
     filter: Option<String>,
 
     #[arg(long = "seed", help = "Random seed")]
-    seed: Option<u32>,
+    seed: Option<u64>,
 
     #[arg(long = "rectify", help = "Rectify grains with random polarity")]
     rectify: Option<bool>,
@@ -161,6 +161,8 @@ fn parse_intervals(intervals: String) -> Vec<std::ops::Range<f32>> {
         .collect()
 }
 
+// TODO: make this generate a random string that doesn't rely on the seed
+// or instead hash the config and use that as a part of the file name for uniqueness
 fn generate_random_string(length: usize) -> String {
     let random_string: String = (0..length).map(|_| fastrand::alphabetic()).collect();
 
@@ -345,7 +347,7 @@ fn main() {
     let output_duration: f32 = matches.duration_in_sec.unwrap_or(100.0);
     let grain_size: u32 = matches.max_grain_size_in_samples.unwrap_or(8000);
     let grain_count: usize = matches.grain_count.unwrap_or(100000);
-    let seed: u32 = matches.seed.unwrap_or(rand::random::<u32>());
+    let seed: u64 = matches.seed.unwrap_or(rand::random::<u64>());
     let report_interval: usize = grain_count / 1000;
     let panning: f32 = matches.panning.unwrap_or(1.0).clamp(0.0, 1.0);
     let file_percentage: f32 = matches.file_percentage.unwrap_or(1.0).clamp(0.0, 1.0);
@@ -358,7 +360,7 @@ fn main() {
     let rectify = matches.rectify.unwrap_or(false);
     let file_filter_regex = regex::Regex::new(&file_filter).unwrap();
 
-    fastrand::seed(seed as u64);
+    fastrand::seed(seed);
 
     let wav_paths: Vec<_> = WalkDir::new(input_dir.clone())
         .into_iter()
@@ -369,7 +371,7 @@ fn main() {
                     || file_filter_regex.is_match(p.path().to_str().unwrap()))
         })
         .filter_map(|f| f.ok())
-        .filter(|f| (file_percentage == 1.0 || fastrand::bool()) && mmap_wav_reader(f).is_ok())
+        .filter(|f| (file_percentage == 1.0 || fastrand::f32() < file_percentage) && mmap_wav_reader(f).is_ok())
         .collect();
 
     if wav_paths.len() == 0 {
@@ -430,10 +432,10 @@ fn main() {
                 output.resize(output_duration_samples as usize, 0.0);
 
                 // let perlin = Perlin::new(seed);
-                let ridged = RidgedMulti::<Perlin>::new(seed);
-                let fbm = Fbm::<Perlin>::new(seed);
+                // let ridged = RidgedMulti::<Perlin>::new(seed as u32);
+                // let fbm = Fbm::<Perlin>::new(seed as u32);
                 // let noise_gen = Blend::new(perlin, ridged, fbm);
-                let noise_gen = PerlinSurflet::new(seed);
+                let noise_gen = PerlinSurflet::new(seed as u32);
 
                 for path in path_receiver.iter() {
                     // we've already verified that files can be read as a
@@ -653,10 +655,12 @@ fn main() {
         .collect();
 
     let output_name = format!(
-        "{}-{}.wav",
+        "{}-{}-seed-{}.wav",
         output_base_name.to_str().unwrap(),
-        generate_random_string(8)
+        generate_random_string(3),
+        fastrand::get_seed()
     );
+
 
     let mut writer = WavWriter::create(output_name, spec).unwrap();
 
